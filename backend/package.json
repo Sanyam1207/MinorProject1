@@ -1,0 +1,46 @@
+{
+  "name": "backendsih2026",
+  "version": "1.0.0",
+  "description": "TNP",
+  "keywords": [
+    "the"
+  ],
+  "homepage": "https://github.com/Utkarsh-660/Backend#readme",
+  "bugs": {
+    "url": "https://github.com/Utkarsh-660/Backend/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Utkarsh-660/Backend.git"
+  },
+  "license": "ISC",
+  "author": "sanyam",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon src/index.js",
+    "start": "node src/index.js",
+    "seed:alumni": "node scripts/seed-alumni.js",
+    "setup:interview-speech": "node scripts/setup-interview-speech.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.19.0",
+    "bcrypt": "^6.0.0",
+    "cheerio": "^1.2.0",
+    "cloudinary": "^2.11.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-validator": "^7.3.2",
+    "google-auth-library": "^11.0.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.9.3",
+    "nodemailer": "^10.0.0",
+    "nodemon": "^3.1.14",
+    "sherpa-onnx-node": "^1.13.7",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
+  }
+}
