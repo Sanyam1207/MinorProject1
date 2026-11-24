@@ -1,5 +1,6 @@
-import { useSelector } from "react-redux";
-import { BarChart3, BookOpen, Lightbulb, AlertTriangle, Sparkles, TrendingUp, CheckCircle2 } from "lucide-react";
+import { useDispatch, useSelector } from "react-redux";
+import { BarChart3, BookOpen, Lightbulb, AlertTriangle, RotateCcw, Sparkles, TrendingUp, CheckCircle2 } from "lucide-react";
+import { runAIFeature } from "../services/aiRequestHandler.js";
 
 const SEVERITY_STYLES = {
   high: { bg: "bg-red-100", border: "border-red-400", text: "text-red-800", badge: "bg-red-200" },
@@ -124,14 +125,17 @@ function SuggestionCards({ suggestions }) {
 }
 
 export default function GapAnalysisPanel() {
-  const workspace = useSelector((state) => state.aiChat.gapAnalysisWorkspace);
+  const dispatch = useDispatch();
+  const workspace = useSelector((state) => state.aiChat.gapAnalysisWorkspace) || {};
   const aiLoading = useSelector((state) =>
-    Object.values(state.aiChat.requests).some(
-      (r) => r.status === "pending" || r.status === "streaming"
+    Object.values(state.aiChat.requests || {}).some(
+      (r) => r?.status === "pending" || r?.status === "streaming"
     )
   );
+  const runAnalysis = () => dispatch(runAIFeature("gap-analysis"));
 
   const { status, gaps, suggestions, error } = workspace;
+  const errorText = typeof error === "string" ? error : error?.message || "The analysis could not be completed.";
   const hasGaps = gaps && gaps.length > 0;
   const hasSuggestions = suggestions && suggestions.length > 0;
   const hasData = hasGaps || hasSuggestions;
@@ -172,22 +176,29 @@ export default function GapAnalysisPanel() {
               Start a conversation in the chat to analyse gaps between your current curriculum
               and industry-demanded skills. The AI will suggest electives to bridge those gaps.
             </p>
-            {aiLoading && (
+            {aiLoading || status === "analysing" ? (
               <div className="mt-3 flex items-center gap-2 text-xs font-bold">
                 <Sparkles className="h-4 w-4 animate-spin" />
                 <span>Analysing curriculum data…</span>
               </div>
+            ) : (
+              <button type="button" onClick={runAnalysis} className="btn-primary mt-3 min-h-11 px-3 py-1.5 text-xs sm:min-h-0">
+                <Sparkles className="h-3.5 w-3.5" aria-hidden="true" /> RUN ANALYSIS
+              </button>
             )}
           </div>
         )}
 
         {/* Error State */}
-        {status === "error" && error && (
-          <div className="border-2 border-black bg-red-100 p-3 mt-4">
+        {status === "error" && (
+          <div role="alert" className="mt-4 flex flex-wrap items-center justify-between gap-2 border-2 border-black bg-red-100 p-3">
             <div className="flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-red-600" />
-              <span className="text-xs font-bold text-red-800">{error}</span>
+              <span className="text-xs font-bold text-red-800">{errorText}</span>
             </div>
+            <button type="button" onClick={runAnalysis} disabled={aiLoading} className="btn-primary min-h-11 px-3 py-1.5 text-xs disabled:opacity-50 sm:min-h-0">
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" /> RUN AGAIN
+            </button>
           </div>
         )}
       </div>

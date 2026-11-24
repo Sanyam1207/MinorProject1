@@ -1,209 +1,78 @@
-import React, { useState } from "react";
-import { Building2, Plus, CheckCircle, ShieldCheck, DollarSign, MapPin } from "lucide-react";
-import { api } from "../lib/api";
+import { useSelector } from "react-redux";
+import { Briefcase, Building2, Clock, FilePlus2, UserRoundCheck } from "lucide-react";
+import { getPlacementContext, listDrives } from "../lib/api/admin.js";
+import DrivesPanel from "../features/tpo/DrivesPanel.jsx";
+import ApplicantsPanel from "../features/tpo/ApplicantsPanel.jsx";
+import { EmptyState, useAsync } from "../ui/index.js";
+import BackBar from "../workspace/BackBar.jsx";
+import ToolTile from "../workspace/ToolTile.jsx";
+import { openPanel, panelTitle } from "../workspace/index.js";
 
+/** Recruiter (company) workspace (FRONTEND.md §12.4): own drives and their applicants. */
 export default function CompanyMode({ user }) {
-  const [companyName, setCompanyName] = useState(() => user?.company?.name || user?.companyName || "");
-  const [roleTitle, setRoleTitle] = useState("");
-  const [jdText, setJdText] = useState("");
-  const [minCgpa, setMinCgpa] = useState("7.5");
-  const [eligibleBranch, setEligibleBranch] = useState("Computer Science, Information Technology");
-  const [skillsRequired, setSkillsRequired] = useState("React, Node.js, TypeScript, SQL");
-  const [packageLpa, setPackageLpa] = useState("18 LPA");
-  const [location, setLocation] = useState("Bengaluru / Hybrid");
-  const [driveDate, setDriveDate] = useState("");
-  const [deadline, setDeadline] = useState("");
-  const [posting, setPosting] = useState(false);
-  const [successMsg, setSuccessMsg] = useState("");
+  const activeFeature = useSelector((state) => state.appContext.activeFeature);
+  const activePanel = useSelector((state) => state.appContext.activePanel);
+  const context = useAsync(() => getPlacementContext(), [user?._id]);
+  const drives = useAsync(() => listDrives({ status: "all" }), [user?._id, activeFeature]);
 
-  const handleCreateDrive = async (e) => {
-    e.preventDefault();
-    setPosting(true);
-    setSuccessMsg("");
-    try {
-      await api.createDrive({
-        companyName,
-        title: roleTitle,
-        description: jdText,
-        driveDate,
-        deadline: deadline || undefined,
-        minCgpa: parseFloat(minCgpa),
-        eligibleBranch: eligibleBranch.split(",").map(s => s.trim()),
-        skillsRequired: skillsRequired.split(",").map(s => s.trim()),
-        packageLpa,
-        location
-      });
-      setSuccessMsg(`Successfully published placement drive for '${roleTitle}'!`);
-      setRoleTitle("");
-      setJdText("");
-      setDriveDate("");
-      setDeadline("");
-    } catch (err) {
-      alert("Failed to post drive.");
-    } finally {
-      setPosting(false);
-    }
-  };
+  const companyName = context.data?.company?.name || user?.company?.name || user?.companyName || user?.name || "Recruiter";
+  const notLinked = context.data && !context.data.company;
+  const items = drives.data?.items ?? [];
+  const pending = items.filter((drive) => drive.status === "pending").length;
+  const active = items.filter((drive) => drive.status === "active").length;
+  const applicants = items.reduce((sum, drive) => sum + (drive.applicantCount ?? 0), 0);
+
+  const tiles = [
+    { icon: Briefcase, title: "MY DRIVES", description: "Your posted drives, their review status and applicant counts.", badge: `${active} ACTIVE · ${pending} IN REVIEW`, badgeClass: "bg-blue-100", onClick: () => openPanel("company.drives") },
+    { icon: FilePlus2, title: "POST A DRIVE", description: "Submit a new drive; the placement office reviews it before students see it.", badge: "NEW", badgeClass: "bg-green-200", onClick: () => openPanel("company.drives", { create: true }) },
+    { icon: UserRoundCheck, title: "APPLICANTS", description: "Shortlist, interview, reject and make offers across your drives.", badge: `${applicants} APPLICANTS`, badgeClass: "bg-yellow-100", onClick: () => openPanel("company.applicants") },
+  ];
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      {/* Header Banner */}
+    <div className="mx-auto max-w-6xl space-y-6">
       <div className="card-stark bg-white">
-        <div className="flex items-center justify-between border-b-2 border-black pb-3 mb-3">
-          <div className="flex items-center gap-2">
-            <Building2 className="w-6 h-6" />
-            <div>
-              <h2 className="font-black text-lg uppercase">RECRUITER / COMPANY PORTAL</h2>
-              <p className="text-xs font-semibold text-gray-600">
-                Verified Official Email: <span className="font-mono underline">{user?.officialEmail || "recruiter@company.com"}</span>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Building2 className="h-6 w-6 shrink-0" aria-hidden="true" />
+            <div className="min-w-0">
+              <h2 className="truncate text-lg font-black uppercase">{companyName}</h2>
+              <p className="truncate text-xs font-semibold text-gray-600">
+                {user?.name && user.name !== companyName ? `${user.name} · ` : ""}
+                <span className="font-mono">{user?.email || ""}</span>
+                {context.data?.college?.name ? ` · ${context.data.college.name}` : ""}
               </p>
             </div>
           </div>
-          <span className="badge-stark bg-green-200 text-xs">
-            <ShieldCheck className="w-3.5 h-3.5" /> VERIFIED RECRUITER
-          </span>
+          <span className="badge-stark bg-black text-xs text-white">RECRUITER</span>
         </div>
-      </div>
-
-      {/* Post Placement Drive Form */}
-      <div className="card-stark bg-white">
-        <div className="flex items-center gap-2 border-b-2 border-black pb-2 mb-4">
-          <Plus className="w-5 h-5" />
-          <h3 className="font-black text-sm uppercase">POST NEW PLACEMENT DRIVE</h3>
-        </div>
-
-        {successMsg && (
-          <div className="mb-4 p-3 bg-green-100 border-2 border-black text-xs font-bold text-black flex items-center gap-2">
-            <CheckCircle className="w-4 h-4 text-black" />
-            <span>{successMsg}</span>
-          </div>
+        {notLinked && (
+          <p className="mt-3 border-2 border-black bg-yellow-100 p-2 text-[11px] font-bold">
+            Your account is not linked to a company yet. Ask the placement office to update your recruiter account.
+          </p>
         )}
-
-        <form onSubmit={handleCreateDrive} className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Company Name</label>
-              <input
-                type="text"
-                required
-                value={companyName}
-                onChange={(e) => setCompanyName(e.target.value)}
-                placeholder="e.g. Infosys"
-                className="input-stark w-full text-xs font-bold"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Role Title</label>
-              <input
-                type="text"
-                required
-                placeholder="e.g. Full Stack Developer (SDE-1)"
-                value={roleTitle}
-                onChange={(e) => setRoleTitle(e.target.value)}
-                className="input-stark w-full text-xs"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-extrabold uppercase mb-1">Job Description & Responsibilities</label>
-            <textarea
-              required
-              rows={4}
-              placeholder="Describe key responsibilities, team structure, and project scope..."
-              value={jdText}
-              onChange={(e) => setJdText(e.target.value)}
-              className="input-stark w-full text-xs"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Min Cutoff CGPA</label>
-              <input
-                type="number"
-                step="0.1"
-                min="0"
-                max="10"
-                value={minCgpa}
-                onChange={(e) => setMinCgpa(e.target.value)}
-                className="input-stark w-full text-xs font-bold"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Package Offered (LPA)</label>
-              <input
-                type="text"
-                value={packageLpa}
-                onChange={(e) => setPackageLpa(e.target.value)}
-                className="input-stark w-full text-xs font-bold"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Job Location</label>
-              <input
-                type="text"
-                value={location}
-                onChange={(e) => setLocation(e.target.value)}
-                className="input-stark w-full text-xs"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Campus Drive Date</label>
-              <input
-                type="date"
-                required
-                value={driveDate}
-                onChange={(e) => setDriveDate(e.target.value)}
-                className="input-stark w-full text-xs font-bold"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Application Deadline</label>
-              <input
-                type="date"
-                value={deadline}
-                max={driveDate || undefined}
-                onChange={(e) => setDeadline(e.target.value)}
-                className="input-stark w-full text-xs font-bold"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Eligible Branches (Comma-separated)</label>
-              <input
-                type="text"
-                value={eligibleBranch}
-                onChange={(e) => setEligibleBranch(e.target.value)}
-                className="input-stark w-full text-xs"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-extrabold uppercase mb-1">Required Skills (Comma-separated)</label>
-              <input
-                type="text"
-                value={skillsRequired}
-                onChange={(e) => setSkillsRequired(e.target.value)}
-                className="input-stark w-full text-xs"
-              />
-            </div>
-          </div>
-
-          <div className="pt-2">
-            <button type="submit" disabled={posting} className="btn-primary w-full justify-center py-2 text-xs">
-              <span>{posting ? "PUBLISHING DRIVE..." : "PUBLISH PLACEMENT DRIVE"}</span>
-            </button>
-          </div>
-        </form>
+        {pending > 0 && !activeFeature && (
+          <p className="mt-3 flex items-center gap-1.5 text-[11px] font-bold text-gray-700">
+            <Clock className="h-3.5 w-3.5" aria-hidden="true" /> {pending} drive{pending === 1 ? " is" : "s are"} awaiting review by the placement office.
+          </p>
+        )}
       </div>
+
+      {!activeFeature ? (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {tiles.map(({ title, ...tile }) => <ToolTile key={title} title={title} {...tile} />)}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          <BackBar label="RECRUITER HOME" title={panelTitle(activePanel)} onBack={() => openPanel("company.home")} />
+          {activeFeature === "drives" ? (
+            <DrivesPanel scope="company" />
+          ) : activeFeature === "applicants" ? (
+            <ApplicantsPanel scope="company" />
+          ) : (
+            <EmptyState title="This tool isn't available" text="Go back to recruiter home and pick another tool." />
+          )}
+        </div>
+      )}
     </div>
   );
 }
