@@ -3,25 +3,26 @@
 Tests all 17 scenarios described in the implementation spec.
 
 Usage:
-    # Start the backend first:
-    cd Python-Backend---Agentic-flow
-    python -m app.main
+    # Start the service first (needs a real GEMINI_API_KEY in ai-service/.env):
+    cd ai-service && .venv/bin/python -m app.main
 
-    # Then in a separate terminal:
-    python scripts/test_job_creator.py
+    # Then in a separate terminal (same AI_SERVICE_TOKEN as the service, if set):
+    AI_SERVICE_TOKEN=... .venv/bin/python scripts/test_job_creator.py
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
 import socketio
 
-URL = "http://localhost:9000"
+URL = os.getenv("AI_URL", f"http://127.0.0.1:{os.getenv('AI_PORT', '9000')}")
+AUTH = {"token": os.environ["AI_SERVICE_TOKEN"]} if os.getenv("AI_SERVICE_TOKEN") else None
 
 # Shared institutional context
 META_DATA = {
@@ -85,7 +86,7 @@ async def send_request(
         if data.get("isEnd"):
             done.set()
 
-    await sio.connect(URL)
+    await sio.connect(URL, auth=AUTH)
     await sio.emit(
         "query",
         {
@@ -500,7 +501,7 @@ async def test_17_mode_detection():
         if data.get("isEnd"):
             done.set()
 
-    await sio.connect(URL)
+    await sio.connect(URL, auth=AUTH)
     await sio.emit("query", {
         "requestId": "req-17",
         "sessionId": "test-17",

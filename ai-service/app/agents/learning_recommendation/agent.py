@@ -9,6 +9,7 @@ from app.agents.learning_recommendation.prompt import SYSTEM_PROMPT, build_user_
 from app.agents.learning_recommendation.schemas import LearningRecommendationChunk
 from app.agents.routing import RoutingRules
 from app.schemas import QueryRequest
+from app.agents.roles import resolve_role
 
 
 _FACTORS = (
@@ -234,7 +235,7 @@ class LearningRecommendationAgent:
         return LearningRecommendationChunk.error(message)
 
     async def run(self, req: QueryRequest) -> AsyncIterator[Any]:
-        if str(req.user_role or "student").lower() != "student":
+        if resolve_role(req) != "student":
             yield LearningRecommendationChunk.error("Interview recommendations are currently available only to students.")
             return
 

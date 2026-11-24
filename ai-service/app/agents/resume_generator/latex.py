@@ -1,33 +1,19 @@
 """LaTeX streaming from Gemini for the Resume Generator Agent.
 
-Uses the same SSE streaming pattern as ``job_finder.py`` — raw ``httpx``
-against the ``streamGenerateContent?alt=sse`` endpoint.
+All calls go through the shared client (``app/llm/gemini.py``): the API key
+travels in a header, never in a URL.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, AsyncIterator, Dict, List, Tuple, Optional
 
-import httpx
-
-from app.config import settings
+from app.llm import gemini
 
 log = logging.getLogger("resume_agent.latex")
 
-_SSE_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{settings.GEMINI_MODEL}:streamGenerateContent"
-    f"?key={settings.GEMINI_API_KEY}&alt=sse"
-)
-
-# Non-streaming endpoint (used for the conversational collection phase)
-_SYNC_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{settings.GEMINI_MODEL}:generateContent"
-    f"?key={settings.GEMINI_API_KEY}"
-)
+_CHAT_FALLBACK = "I'm having trouble processing that right now. Could you please try again?"
 
 
 # ---------------------------------------------------------------------------
@@ -48,51 +34,32 @@ async def stream_gemini_text(
     history:        Prior conversation turns (list of role/parts dicts).
     user_turn:      The new user message to append.
 
-    Yields raw text chunks as they arrive over the SSE stream.
+    Yields raw text chunks as they arrive over the SSE stream; on failure an
+    inline ``[LaTeX generation ...]`` marker (as before).
     """
-    contents = list(history) + [{"role": "user", "parts": [{"text": user_turn}]}]
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 8192,
-        },
-    }
-
+    contents = list(history) + [gemini.user_turn(user_turn)]
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", _SSE_ENDPOINT, json=payload) as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    log.warning(
-                        "Gemini SSE returned %d: %s", resp.status_code, body[:200]
-                    )
-                    yield f"\n[LaTeX generation error: HTTP {resp.status_code}]\n"
-                    return
-
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    json_str = line[6:].strip()
-                    if not json_str or json_str == "[DONE]":
-                        continue
-                    try:
-                        data = json.loads(json_str)
-                        chunk = (
-                            data["candidates"][0]["content"]["parts"][0]["text"]
-                        )
-                        if chunk:
-                            yield chunk
-                    except (KeyError, IndexError, json.JSONDecodeError):
-                        pass
-
-    except httpx.TimeoutException:
-        log.error("Gemini SSE timed out")
-        yield "\n[LaTeX generation timed out]\n"
-    except Exception as exc:
-        log.exception("Gemini SSE error")
-        yield f"\n[LaTeX generation error: {exc}]\n"
+        async for chunk in gemini.stream_text(
+            contents=contents,
+            system=system_prompt,
+            generation_config={"temperature": 0.3, "maxOutputTokens": 8192},
+            timeout=60,
+        ):
+            if chunk:
+                yield chunk
+    except gemini.GeminiNotConfigured:
+        log.warning("Gemini is not configured; cannot generate LaTeX")
+        yield "\n[LaTeX generation error: the AI model is not configured]\n"
+    except gemini.GeminiError as exc:
+        if exc.reason in ("timeout", "deadline"):
+            log.error("Gemini SSE timed out")
+            yield "\n[LaTeX generation timed out]\n"
+        elif exc.status:
+            log.warning("Gemini SSE returned %s", exc.status)
+            yield f"\n[LaTeX generation error: HTTP {exc.status}]\n"
+        else:
+            log.warning("Gemini SSE failed: %s", exc)
+            yield f"\n[LaTeX generation error: {exc.reason}]\n"
 
 
 # ---------------------------------------------------------------------------
@@ -160,35 +127,13 @@ async def call_gemini_chat(
 ) -> str:
     """Single non-streaming call to Gemini for conversational replies.
 
-    Returns the complete response text.
+    Returns the complete response text, or a short fallback sentence.
     """
-    contents = list(history) + [{"role": "user", "parts": [{"text": user_turn}]}]
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 512,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(_SYNC_ENDPOINT, json=payload)
-            if resp.status_code != 200:
-                log.warning("Gemini chat failed with %d: %s", resp.status_code, resp.text)
-                return "I'm having trouble processing that right now. Could you please try again?"
-            
-            try:
-                data = resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return text.strip()
-            except Exception as e:
-                log.error("Failed to parse Gemini response: %s | Raw response: %s", e, resp.text)
-                return "I'm having trouble processing that right now. Could you please try again?"
-    except httpx.TimeoutException:
-        log.warning("Gemini chat timed out")
-        return "I'm having trouble processing that right now. Could you please try again?"
-    except Exception as exc:
-        log.exception("Gemini chat call failed unexpectedly")
-        return "I'm having trouble processing that right now. Could you please try again?"
+    text = await gemini.generate_text(
+        contents=list(history) + [gemini.user_turn(user_turn)],
+        system=system_prompt,
+        temperature=0.4,
+        max_output_tokens=512,
+        timeout=20,
+    )
+    return text if text is not None else _CHAT_FALLBACK

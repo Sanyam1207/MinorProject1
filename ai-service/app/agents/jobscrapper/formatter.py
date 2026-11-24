@@ -1,29 +1,23 @@
+"""Job-list payload and markdown for ``mode:jobparser:jobslist`` (JOB-FEED.md §12.5/§12.7)."""
+
 from typing import Any, Dict, List
+
+from app.agents.jobscrapper.search import crawl_item, is_list_item
 
 
 def format_job_for_data(job: Dict[str, Any], role: str = "") -> Dict[str, Any]:
-    """Format a job for the structured UI payload."""
-    company_name = job.get("company_name") or job.get("company") or "Not mentioned"
-    job_type = job.get("job_type") or job.get("employment_type") or "Not mentioned"
-    salary = job.get("salary") or job.get("stipend") or "Not mentioned"
-    experience = job.get("experience") or "Not mentioned"
-    job_domain = job.get("job_domain") or job.get("category") or "Other"
-    title = job.get("title") or "Not mentioned"
-    application_url = job.get("application_url") or "Not mentioned"
+    """The JobsListItem for *job*.
 
-    return {
-        "title": title,
-        "company_name": company_name,
-        "job_type": job_type,
-        "salary": salary,
-        "experience": experience,
-        "job_domain": job_domain,
-        "application_url": application_url,
-        "location": job.get("location") or "Not mentioned",
-        "skills": job.get("skills") or [],
-        "description": job.get("description") or "",
-        "requirements": job.get("requirements") or "",
-    }
+    Idempotent: an item that already has the §12.5 shape is returned
+    unchanged; a legacy crawler dict (``Job.model_dump()``) becomes a crawl item.
+    """
+    if is_list_item(job):
+        return job
+    return crawl_item(job if isinstance(job, dict) else {})
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
 
 
 def format_jobs_markdown(
@@ -31,28 +25,35 @@ def format_jobs_markdown(
     role: str = "student",
     status_header: str = "",
 ) -> str:
-    """Create the human-readable response for the UI combining status header and job summary."""
-    job_count = len(scraped_jobs)
+    """The chat text shown next to a job list: status line(s) + a one-line summary."""
+    items = [item for item in scraped_jobs if isinstance(item, dict)]
     header_prefix = f"{status_header.strip()}\n\n" if status_header.strip() else ""
+    total = len(items)
+    if total == 0:
+        return status_header.strip()
 
-    if role == "tpo":
-        if job_count > 0:
-            summary = (
-                f"Hello Placement Team! I have found {job_count} job listing(s) for your placement drive. "
-                "You can review these openings and list them directly on your college placement portal for your students."
-            )
-        else:
-            summary = (
-                "Hello Placement Team! I am searching for job listings for your placement drive. "
-                "As soon as openings are found, they will be available here."
-            )
-    else:
-        if job_count > 0:
-            summary = f"Hey there! I have found {job_count} job opportunity(ies) for you."
-        else:
-            summary = (
-                "Hey there! I am searching for job opportunities for you. "
-                "As soon as openings are found, they will be available here."
-            )
+    crawl_only = all(item.get("source") == "crawl" for item in items)
+    if crawl_only:
+        return f"{header_prefix}I found {total} job(s) on that careers page."
 
-    return f"{header_prefix}{summary}"
+    if role in ("tpo", "admin"):
+        return (
+            f"{header_prefix}Hello Placement Team! I found {total} open-market listing(s) you could share "
+            "with students or turn into campus drives."
+        )
+
+    campus = [item for item in items if item.get("kind") == "campus"]
+    external = [item for item in items if item.get("kind") != "campus"]
+    eligible = sum(1 for item in campus if item.get("isEligible") is True)
+    parts: List[str] = []
+    if campus:
+        part = _plural(len(campus), "campus drive", "campus drives")
+        if eligible:
+            part += f" ({eligible} you're eligible for)"
+        parts.append(part)
+    if external:
+        parts.append(_plural(len(external), "open-market listing", "open-market listings"))
+    return (
+        f"{header_prefix}Hey there! I found {total} job(s) for you: {' and '.join(parts)}, best matches first. "
+        "Open the AI-matched tab to apply, or say “save job 2” to add one to your tracker."
+    )

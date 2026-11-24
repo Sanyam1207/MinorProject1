@@ -1,72 +1,96 @@
+"""Per-chat job list ("the 2nd job") and last-viewed job, shared by agents.
+
+The list holds the JobsListItems (JOB-FEED.md §12.5) currently on screen: a new
+search REPLACES it, so "job 2" always means the 2nd card the user sees, in the
+jobs-finder and in the copilot alike. Entries expire after
+``JOBS_SESSION_TTL_SECONDS`` without use; at most ``JOBS_SESSION_MAX`` chats
+are kept (least recently used evicted).
+"""
+
+from __future__ import annotations
+
+import copy
 import logging
-from typing import Dict, List, Any
-from threading import Lock
+import threading
+from typing import Any, Dict, List, Optional
+
+from app.config import settings
+from app.utils.ttl_store import TTLStore
 
 logger = logging.getLogger(__name__)
 
 
 class SessionJobStore:
-    """In-memory thread-safe storage for scraped job listings and last-viewed job context keyed by session ID."""
+    """Thread-safe, size-capped job context keyed by session id."""
 
-    def __init__(self):
-        self._store: Dict[str, List[Dict[str, Any]]] = {}
-        self._last_viewed: Dict[str, Dict[str, Any]] = {}
-        self._lock = Lock()
+    def __init__(self) -> None:
+        self._store: TTLStore[Dict[str, Any]] = TTLStore(
+            "jobs-session",
+            ttl_seconds=lambda: settings.JOBS_SESSION_TTL_SECONDS,
+            max_items=lambda: settings.JOBS_SESSION_MAX,
+        )
+        self._lock = threading.Lock()
 
-    def save_jobs(self, session_id: str, jobs: List[Dict[str, Any]]) -> None:
-        """Store or update jobs for a session ID."""
+    def _entry(self, session_id: str) -> Dict[str, Any]:
+        return self._store.get_or_create(session_id, lambda: {"jobs": [], "last_viewed": None})
+
+    def replace_jobs(self, session_id: str, items: List[Dict[str, Any]]) -> None:
+        """Replace the cached list with *items* (a new search result)."""
         if not session_id:
             return
         with self._lock:
-            if session_id not in self._store:
-                self._store[session_id] = []
-            
-            # Deduplicate by title + company + application_url
-            existing_keys = {
-                (
-                    j.get("title", "").lower(),
-                    j.get("company", j.get("company_name", "")).lower(),
-                    j.get("application_url", "").lower()
-                )
-                for j in self._store[session_id]
-            }
+            entry = self._entry(session_id)
+            entry["jobs"] = [copy.deepcopy(item) for item in items if isinstance(item, dict)]
 
-            for job in jobs:
-                key = (
-                    job.get("title", "").lower(),
-                    job.get("company", job.get("company_name", "")).lower(),
-                    job.get("application_url", "").lower()
-                )
-                if key not in existing_keys:
-                    self._store[session_id].append(job)
-                    existing_keys.add(key)
+    # Backwards-compatible name: a new result set always replaces the old one.
+    save_jobs = replace_jobs
+
+    def update_job(self, session_id: str, job_id: str, **fields: Any) -> bool:
+        """Update fields of the cached item with *job_id*; True when found."""
+        if not session_id or not job_id:
+            return False
+        with self._lock:
+            entry = self._store.get(session_id)
+            if not entry:
+                return False
+            found = False
+            for item in entry["jobs"]:
+                if str(item.get("id")) == str(job_id):
+                    item.update(fields)
+                    found = True
+            last = entry.get("last_viewed")
+            if isinstance(last, dict) and str(last.get("id")) == str(job_id):
+                last.update(fields)
+            return found
 
     def get_jobs(self, session_id: str) -> List[Dict[str, Any]]:
-        """Retrieve stored jobs for a session ID."""
         if not session_id:
             return []
         with self._lock:
-            return list(self._store.get(session_id, []))
+            entry = self._store.get(session_id)
+            return [copy.deepcopy(item) for item in entry["jobs"]] if entry else []
 
     def set_last_viewed_job(self, session_id: str, job: Dict[str, Any]) -> None:
-        """Track the most recently detailed/elaborated job for a session ID."""
-        if not session_id or not job:
+        if not session_id or not isinstance(job, dict) or not job:
             return
         with self._lock:
-            self._last_viewed[session_id] = job
+            self._entry(session_id)["last_viewed"] = copy.deepcopy(job)
 
-    def get_last_viewed_job(self, session_id: str) -> Dict[str, Any] | None:
-        """Retrieve the most recently detailed/elaborated job for a session ID."""
+    def get_last_viewed_job(self, session_id: str) -> Optional[Dict[str, Any]]:
         if not session_id:
             return None
         with self._lock:
-            return self._last_viewed.get(session_id)
+            entry = self._store.get(session_id)
+            last = entry.get("last_viewed") if entry else None
+            return copy.deepcopy(last) if isinstance(last, dict) else None
 
-    def clear(self, session_id: str) -> None:
-        """Clear cached jobs and last-viewed job for a session ID."""
+    def clear(self, session_id: Optional[str] = None) -> None:
+        """Forget one chat's jobs (or every chat when *session_id* is None)."""
         with self._lock:
-            self._store.pop(session_id, None)
-            self._last_viewed.pop(session_id, None)
+            if session_id is None:
+                self._store.clear()
+            else:
+                self._store.pop(session_id)
 
 
 # Global singleton instance

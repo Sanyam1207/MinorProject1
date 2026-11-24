@@ -12,6 +12,9 @@ class AgentMode(str, Enum):
     ALUMNI_CONNECT = "alumni-connect"
     GAP_ANALYSIS = "gap-analysis"
     LEARNING_RECOMMENDATION = "learning-recommendation"
+    # Tool-calling campus assistant (attendance, applications, offers, ...).
+    # Also the fallback when no other agent matches.
+    COPILOT = "copilot"
 
     @classmethod
     def from_name(cls, mode_name: Any) -> Optional["AgentMode"]:
@@ -72,6 +75,15 @@ class AgentMode(str, Enum):
             "learning-recommendation": cls.LEARNING_RECOMMENDATION,
             "learning-plan": cls.LEARNING_RECOMMENDATION,
             "improvement-plan": cls.LEARNING_RECOMMENDATION,
+            # Copilot aliases -- attendance is served by the copilot's tools,
+            # never by a separate attendance mode.
+            "copilot": cls.COPILOT,
+            "assistant": cls.COPILOT,
+            "agent": cls.COPILOT,
+            "general": cls.COPILOT,
+            "campus-assistant": cls.COPILOT,
+            "attendance": cls.COPILOT,
+            "attendance-agent": cls.COPILOT,
         }
         return aliases.get(normalized) or next(
             (mode for mode in cls if mode.value == normalized), None

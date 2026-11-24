@@ -25,6 +25,7 @@ import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from app.schemas import QueryRequest
+from app.agents.roles import resolve_role
 from app.agents.routing import RoutingRules
 from app.agents.gap_analysis.schemas import GapAnalysisChunk
 from app.agents.gap_analysis.prompt import SYSTEM_PROMPT, build_user_turn
@@ -77,8 +78,8 @@ class GapAnalysisAgent:
 
     async def run(self, req: QueryRequest) -> AsyncIterator[Any]:
         # ── 1. Authorization — only TPO can use gap analysis ─────────────
-        raw_role = (getattr(req, "user_role", None) or "").strip().lower()
-        if raw_role != "tpo":
+        # Defence in depth: the router never sends students here.
+        if resolve_role(req) not in ("tpo", "admin"):
             yield GapAnalysisChunk.error_chunk(
                 response=(
                     "Gap analysis is only available for HOD / TPO users. "

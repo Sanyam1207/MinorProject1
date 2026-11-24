@@ -1,14 +1,6 @@
 import asyncio
 import logging
-import sys
 from typing import Optional
-
-# Ensure Windows ProactorEventLoopPolicy is set for Playwright subprocesses
-if sys.platform == "win32":
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
 
 try:
     from playwright.async_api import async_playwright, Playwright, Browser

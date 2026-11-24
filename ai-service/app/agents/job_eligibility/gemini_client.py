@@ -19,19 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any, Dict, Optional
 
-import httpx
-
-from app.config import settings
+from app.llm import gemini
 
 logger = logging.getLogger(__name__)
-
-_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
-)
 
 # {query} is filled in at call time -- doubled braces below are literal
 # braces in the JSON-shaped instructions.
@@ -138,34 +130,13 @@ async def interpret_query(
         ensure_ascii=True,
     )
     prompt = _PROMPT_TEMPLATE.format(query=user_query.replace('"', "'"), context=context)
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json"},
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(_ENDPOINT, json=payload)
-
-            if response.status_code != 200:
-                logger.warning(
-                    "Gemini eligibility extraction failed: HTTP %s -- %s",
-                    response.status_code, response.text[:300],
-                )
-                return None
-
-            data = response.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            # Strip markdown fences defensively, in case the model adds them
-            # despite the JSON response_mime_type / prompt instruction.
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-
-            parsed = json.loads(text)
-            if not isinstance(parsed, dict) or "action" not in parsed:
-                logger.warning("Gemini eligibility extraction returned an unexpected shape: %r", parsed)
-                return None
-            return parsed
-
-    except Exception:
-        logger.exception("Gemini eligibility extraction errored")
+    parsed = await gemini.generate_json(
+        contents=[gemini.user_turn(prompt)],
+        timeout=timeout,
+        max_retries=0,
+    )
+    if not isinstance(parsed, dict) or "action" not in parsed:
+        if parsed is not None:
+            logger.warning("Gemini eligibility extraction returned an unexpected shape")
         return None
+    return parsed

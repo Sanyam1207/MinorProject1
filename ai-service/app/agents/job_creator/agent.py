@@ -25,6 +25,7 @@ Workflow
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -32,6 +33,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from app.schemas import QueryRequest
+from app.agents.roles import resolve_role
 from app.agents.routing import RoutingRules
 from app.agents.job_creator.schemas import JobCreationChunk, JobData, JobStatus
 from app.agents.job_creator.session import (
@@ -72,7 +74,13 @@ class JobCreationAgent:
             r"\bnew\s+(job|opening|vacancy)\b",
         ),
         weak=(r"\bpublish\b", r"\blistings?\b", r"\bplacement\s+drive\b"),
-        veto=(r"\bmock\s+interview\b",),
+        veto=(
+            r"\bmock\s+interview\b",
+            # The job tracker belongs to the jobs-finder (JOB-FEED.md §12.9):
+            # "add the 2nd job to my wishlist" must never reach job creation.
+            r"\b(wish\s*-?\s*list|bookmarks?|shortlist(ed)?|favou?rites?|job\s+tracker|saved\s+jobs?)\b",
+            r"\bas\s+applied\b",
+        ),
     )
     SWITCH_MESSAGE = "Sure -- let's get that job posted."
 
@@ -88,8 +96,8 @@ class JobCreationAgent:
         sid = req.sessionId
 
         # ── 1. Authorization — deterministic, before any LLM call ────────────
-        raw_role = (getattr(req, "user_role", None) or "").strip().lower()
-        if raw_role != "tpo":
+        # Defence in depth: the router never sends students here.
+        if resolve_role(req) not in ("tpo", "admin"):
             yield JobCreationChunk.error_chunk(
                 response=(
                     "You are not eligible to create or post a job. "
@@ -127,10 +135,11 @@ class JobCreationAgent:
                 meta_data=meta_data,
             ):
                 yield chunk
-        except Exception as exc:
+        except Exception:
             log.exception("[%s] job-creation agent error", req.requestId)
             yield JobCreationChunk.error_chunk(
-                response=f"Something went wrong while processing your request: {exc}",
+                response="Something went wrong while processing your request. Please try again.",
+                draft_id=session.draft_id,
                 session_id=sid,
             )
         finally:
@@ -153,7 +162,9 @@ class JobCreationAgent:
     ) -> AsyncIterator[Any]:
 
         # ── Fast-path: deterministic confirmation / cancellation detection ────
-        # Only when session is currently awaiting a yes/no from the TPO.
+        # Only when session is currently awaiting a yes/no from the TPO. This
+        # is the ONLY way a job gets posted -- the LLM can never confirm.
+        was_awaiting = session.awaiting_confirmation
         if session.awaiting_confirmation:
             if is_confirmation_intent(user_message):
                 async for chunk in self._do_post(session, sid):
@@ -194,19 +205,10 @@ class JobCreationAgent:
         session.append_history("model", llm_reply)
 
         # ── Deterministic action dispatch from extracted["action"] ────────────
-        action = (extracted.get("action") or "collect").lower()
-
-        # Only honor confirm/cancel actions when in the right state
-        if action == "confirm":
-            if not session.awaiting_confirmation:
-                # LLM classified as confirm but we weren't awaiting — ignore (security)
-                action = "collect"
-            else:
-                async for chunk in self._do_post(session, sid):
-                    yield chunk
-                return
-
-        if action == "cancel" and session.awaiting_confirmation:
+        # An LLM "confirm" is never honoured (only the deterministic classifier
+        # above can post); an LLM "cancel" only while a yes/no was pending.
+        action = str(extracted.get("action") or "collect").lower()
+        if action == "cancel" and was_awaiting:
             async for chunk in self._do_cancel(session, sid):
                 yield chunk
             return
@@ -254,6 +256,7 @@ class JobCreationAgent:
             yield JobCreationChunk.ready_chunk(
                 response=response_text,
                 job=session.job,
+                draft_id=session.draft_id,
                 session_id=sid,
                 is_end=True,
             )
@@ -262,6 +265,7 @@ class JobCreationAgent:
                 response=response_text,
                 job=session.job,
                 missing_fields=session.missing_fields,
+                draft_id=session.draft_id,
                 session_id=sid,
                 is_end=True,
             )
@@ -281,6 +285,7 @@ class JobCreationAgent:
                 or "The job is ready to be posted. Do you want to post it?"
             ),
             job=session.job,
+            draft_id=session.draft_id,
             session_id=sid,
             is_end=True,
         )
@@ -307,28 +312,28 @@ class JobCreationAgent:
                 ),
                 job=session.job,
                 missing_fields=missing,
+                draft_id=session.draft_id,
                 session_id=sid,
                 is_end=True,
             )
             return
 
-        session.awaiting_confirmation = False
-        session.status = JobStatus.POST
+        # Snapshot, then start a fresh draft BEFORE yielding, so a later
+        # "post it" can never post (and Node can never persist) this job twice.
+        posted = copy.deepcopy(session.job)
+        posted_draft = session.draft_id
+        session.reset_after_post()
 
-        log.info(
-            "job-creation session %s confirmed posting: %s @ %s",
-            sid,
-            session.job.job_role,
-            session.job.company_name,
-        )
+        log.info("job-creation draft %s confirmed for posting", posted_draft)
 
         yield JobCreationChunk.post_chunk(
             response=(
-                f"The **{session.job.job_role}** position at **{session.job.company_name}** "
+                f"The **{posted.job_role}** position at **{posted.company_name}** "
                 f"has been posted successfully! Students can now apply before "
-                f"{session.job.app_deadline}."
+                f"{posted.app_deadline}."
             ),
-            job=session.job,
+            job=posted,
+            draft_id=posted_draft,
             session_id=sid,
             is_end=True,
         )
@@ -348,6 +353,7 @@ class JobCreationAgent:
                 "You can make changes or post it whenever you're ready."
             ),
             job=session.job,
+            draft_id=session.draft_id,
             session_id=sid,
             is_end=True,
         )
@@ -374,18 +380,17 @@ class JobCreationAgent:
 # Post-request intent detection (deterministic)
 # ---------------------------------------------------------------------------
 
-_POST_PHRASES = [
-    "post the job", "post it", "publish the job", "publish it",
-    "submit the job", "go live", "make it live", "post now",
-    "post this job", "publish this job", "post the listing",
-]
+POST_REQUEST_RE = re.compile(
+    r"\b(post|publish|submit)\s+(it|this|the\s+job|this\s+job|the\s+listing|now)\b|\b(go|make\s+it)\s+live\b",
+    re.IGNORECASE,
+)
+NEGATION_RE = re.compile(r"\b(don'?t|do\s+not|not\s+yet|never|without)\b", re.IGNORECASE)
 
 
 def _user_wants_to_post(text: str) -> bool:
-    """Return True if the user's message is a request to post the job."""
-    t = text.strip().lower()
-    # Keep to short messages to avoid false positives in longer edits
-    return any(phrase in t for phrase in _POST_PHRASES)
+    """True when the message asks to post the job (and does not negate it)."""
+    t = (text or "").replace("\u2019", "'")
+    return bool(POST_REQUEST_RE.search(t)) and not NEGATION_RE.search(t)
 
 
 # ---------------------------------------------------------------------------

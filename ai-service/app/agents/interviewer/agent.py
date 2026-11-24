@@ -162,6 +162,11 @@ _MODE_LABELS = {
     "resume-generator": "resume builder",
     "job-eligibility": "eligibility checker",
     "job-creation": "job posting tool",
+    "pr-outreach": "outreach email drafting",
+    "alumni-connect": "alumni mentor matching",
+    "gap-analysis": "curriculum gap analysis",
+    "learning-recommendation": "learning plan",
+    "copilot": "campus assistant",
 }
 
 _FALLBACK_FIRST_QUESTION = (

@@ -24,7 +24,9 @@ import logging
 import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from app.config import settings
 from app.schemas import QueryRequest
+from app.utils.ttl_store import TTLStore
 from app.agents.pr_outreach.schemas import PROutreachChunk, EmailDraft
 from app.agents.pr_outreach.prompt import SYSTEM_PROMPT, build_user_turn
 from app.agents.pr_outreach.llm import call_gemini_chat
@@ -33,10 +35,11 @@ from app.agents.routing import RoutingRules
 log = logging.getLogger("pr_outreach.agent")
 
 # ---------------------------------------------------------------------------
-# In-memory session store (same pattern as job_creator/session.py)
+# In-memory session store (TTL + size cap, like every agent store)
 # ---------------------------------------------------------------------------
 
-_sessions: Dict[str, "_OutreachSession"] = {}
+# Conversation turns kept per session (user + model entries).
+MAX_HISTORY_ENTRIES = 40
 
 
 class _OutreachSession:
@@ -52,12 +55,19 @@ class _OutreachSession:
 
     def append(self, role: str, text: str) -> None:
         self.history.append({"role": role, "parts": [{"text": text}]})
+        if len(self.history) > MAX_HISTORY_ENTRIES:
+            del self.history[:-MAX_HISTORY_ENTRIES]
+
+
+_sessions: TTLStore[_OutreachSession] = TTLStore(
+    "pr-outreach",
+    ttl_seconds=lambda: settings.AGENT_SESSION_TTL_SECONDS,
+    max_items=lambda: settings.AGENT_MAX_SESSIONS,
+)
 
 
 def _get_session(session_id: str) -> _OutreachSession:
-    if session_id not in _sessions:
-        _sessions[session_id] = _OutreachSession()
-    return _sessions[session_id]
+    return _sessions.get_or_create(session_id, _OutreachSession)
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +131,10 @@ class PROutreachAgent:
                 history=session.history,
                 user_turn=user_turn,
             )
-        except Exception as exc:
+        except Exception:
             log.exception("[%s] pr-outreach LLM call failed", req.requestId)
             yield PROutreachChunk.error_chunk(
-                response=f"Something went wrong: {exc}",
+                response="Something went wrong while drafting. Please try again.",
             )
             return
 

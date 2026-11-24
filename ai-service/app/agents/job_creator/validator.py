@@ -11,6 +11,8 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Tuple
 
+from app.agents.confirm import classify_reply
+
 # ── Mandatory fields ─────────────────────────────────────────────────────────
 MANDATORY_FIELDS = ["company_name", "job_role", "job_description", "app_deadline"]
 
@@ -22,19 +24,15 @@ FIELD_LABELS = {
     "app_deadline": "application deadline",
 }
 
-# ── Confirmation intent keywords ─────────────────────────────────────────────
-_CONFIRM_PHRASES = [
-    "yes", "confirm", "confirm it", "post it", "go ahead", "do it",
-    "proceed", "sure", "absolutely", "yep", "yeah", "yup", "affirmative",
-    "post the job", "post now", "submit", "finalize", "finalise",
-]
-
-# ── Cancellation intent keywords ─────────────────────────────────────────────
-_CANCEL_PHRASES = [
-    "no", "cancel", "don't post", "dont post", "not yet", "stop",
-    "abort", "nope", "nah", "negative", "hold on", "wait", "never mind",
-    "nevermind",
-]
+# ── Confirmation / cancellation (deterministic, whole-message) ──────────────
+# Extra phrases accepted on top of the shared yes/no vocabulary
+# (app/agents/confirm.py). Substring matching is never used: "make sure the
+# cgpa is 7" or "can you ensure salary is 10 LPA" must not post a job.
+POST_AFFIRMATIVE = (
+    "post it", "post the job", "post this job", "post now", "publish it", "publish the job",
+    "submit", "submit it", "finalize", "finalise", "go live",
+)
+POST_NEGATIVE = ("don't post", "dont post", "do not post", "not yet", "hold on", "wait")
 
 # IST offset (UTC+5:30)
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -163,20 +161,13 @@ def is_deadline_expired(deadline_iso: str, now_iso: Optional[str] = None) -> boo
 
 
 def is_confirmation_intent(text: str) -> bool:
-    """Return True if *text* looks like a 'yes, post it' confirmation."""
-    t = text.strip().lower()
-    # Must be a short message to avoid interpreting long paragraphs
-    if len(t) > 80:
-        return False
-    return any(phrase in t for phrase in _CONFIRM_PHRASES)
+    """True only for a whole-message approval such as "yes", "Yes, post it", "go ahead"."""
+    return classify_reply(text or "", extra_affirmative=POST_AFFIRMATIVE, extra_negative=POST_NEGATIVE) == "affirm"
 
 
 def is_cancellation_intent(text: str) -> bool:
-    """Return True if *text* looks like a 'no, don't post' cancellation."""
-    t = text.strip().lower()
-    if len(t) > 80:
-        return False
-    return any(phrase in t for phrase in _CANCEL_PHRASES)
+    """True only for a whole-message refusal such as "no", "don't post", "not yet"."""
+    return classify_reply(text or "", extra_affirmative=POST_AFFIRMATIVE, extra_negative=POST_NEGATIVE) == "negative"
 
 
 def friendly_missing(missing_fields: List[str]) -> str:

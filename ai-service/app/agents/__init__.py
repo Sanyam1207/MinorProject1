@@ -8,8 +8,9 @@ from app.agents.pr_outreach.agent import PROutreachAgent
 from app.agents.alumni_connect.agent import AlumniConnectAgent
 from app.agents.gap_analysis.agent import GapAnalysisAgent
 from app.agents.learning_recommendation.agent import LearningRecommendationAgent
+from app.agents.copilot import CopilotAgent
 
-# Every agent the orchestrator can route to, keyed by name.
+# Every agent the orchestrator can route to, keyed by name (== AgentMode value).
 REGISTRY: dict[str, Agent] = {
     a.name: a
     for a in (
@@ -22,6 +23,7 @@ REGISTRY: dict[str, Agent] = {
         AlumniConnectAgent(),
         GapAnalysisAgent(),
         LearningRecommendationAgent(),
+        CopilotAgent(),
     )
 }
 
@@ -34,4 +36,5 @@ __all__ = [
     "AlumniConnectAgent",
     "GapAnalysisAgent",
     "LearningRecommendationAgent",
+    "CopilotAgent",
 ]

@@ -3,12 +3,18 @@ from __future__ import annotations
 import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from app.config import settings
 from app.schemas import QueryRequest
+from app.utils.ttl_store import TTLStore
 from app.agents.alumni_connect.schemas import AlumniConnectChunk
 from app.agents.routing import RoutingRules
 
 
-_sessions: Dict[str, Dict[str, Any]] = {}
+_sessions: TTLStore[Dict[str, Any]] = TTLStore(
+    "alumni",
+    ttl_seconds=lambda: settings.AGENT_SESSION_TTL_SECONDS,
+    max_items=lambda: settings.AGENT_MAX_SESSIONS,
+)
 
 _SEND_CONFIRMATION = re.compile(
     r"\balumni\s+connection\s+request\b.*\b(?:sent|created)\b",
@@ -179,7 +185,7 @@ class AlumniConnectAgent:
             yield AlumniConnectChunk.completion()
             return
 
-        session = _sessions.setdefault(req.sessionId, {"matches": [], "draft": None})
+        session = _sessions.get_or_create(req.sessionId, lambda: {"matches": [], "draft": None})
         meta = req.meta_data or {}
         candidates = list(meta.get("candidate_alumni") or [])
         profile = dict(meta.get("profile") or {})

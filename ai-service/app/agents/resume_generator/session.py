@@ -1,9 +1,9 @@
 """In-process session store for the Resume Generator Agent.
 
-Uses a plain Python dict keyed by ``sessionId``.  This is intentionally
-simple and consistent with the rest of the project — which has no external
-persistence layer.  When the project adds a database or Redis, this file is
-the single place to swap the storage backend.
+A ``TTLStore`` keyed by ``sessionId``: idle sessions expire after
+``AGENT_SESSION_TTL_SECONDS`` and at most ``AGENT_MAX_SESSIONS`` are kept
+(least recently used evicted). When the project adds a database or Redis,
+this file is the single place to swap the storage backend.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.config import settings
 from app.agents.resume_generator.schemas import (
     ResumeData,
     SectionStatus,
     SessionStatus,
 )
+from app.utils.ttl_store import TTLStore
 
 log = logging.getLogger("resume_agent.session")
 
@@ -116,20 +118,26 @@ class ResumeSessionState:
 # Process-level store
 # ---------------------------------------------------------------------------
 
-_SESSIONS: Dict[str, ResumeSessionState] = {}
+_SESSIONS: TTLStore[ResumeSessionState] = TTLStore(
+    "resume",
+    ttl_seconds=lambda: settings.AGENT_SESSION_TTL_SECONDS,
+    max_items=lambda: settings.AGENT_MAX_SESSIONS,
+)
 
 
 def get_or_create_session(session_id: str) -> ResumeSessionState:
     """Return the existing session for *session_id*, or create a fresh one."""
-    if session_id not in _SESSIONS:
-        log.info("creating new resume session: %s", session_id)
-        _SESSIONS[session_id] = ResumeSessionState()
-    return _SESSIONS[session_id]
+    session = _SESSIONS.get(session_id)
+    if session is None:
+        log.info("creating new resume session")
+        session = ResumeSessionState()
+        _SESSIONS.set(session_id, session)
+    return session
 
 
 def save_session(session_id: str, state: ResumeSessionState) -> None:
     """Persist (upsert) *state* back into the store."""
-    _SESSIONS[session_id] = state
+    _SESSIONS.set(session_id, state)
 
 
 def delete_session(session_id: str) -> None:

@@ -6,17 +6,10 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from app.config import settings
+from app.llm import gemini
 from app.agents.resume_generator.tailoring import build_tailoring_context, normalize_target_job
 
 log = logging.getLogger("resume_agent.analysis")
-
-_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
-)
 
 _SYSTEM_PROMPT = """
 You are a strict resume evaluator. Compare the actual resume, authoritative candidate profile,
@@ -122,23 +115,14 @@ async def analyze_resume(
         "candidate_profile": resume_data,
         "selected_job": target,
     }, ensure_ascii=False)
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(_ENDPOINT, json={
-                "system_instruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "response_mime_type": "application/json",
-                    "temperature": 0.1,
-                    "maxOutputTokens": 2048,
-                },
-            })
-            response.raise_for_status()
-            text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = json.loads(text)
-            if not isinstance(result, dict):
-                raise TypeError("analysis response was not an object")
-            return _normalize_result(result, analysis_type, target, record)
-    except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        log.warning("resume analysis model fallback: %s", exc)
+    result = await gemini.generate_json(
+        system=_SYSTEM_PROMPT,
+        contents=[gemini.user_turn(prompt)],
+        temperature=0.1,
+        max_output_tokens=2048,
+        timeout=30,
+    )
+    if result is None:
+        log.warning("resume analysis model unavailable; using the deterministic fallback")
         return _fallback_analysis(resume_source, resume_data, target, analysis_type, record)
+    return _normalize_result(result, analysis_type, target, record)

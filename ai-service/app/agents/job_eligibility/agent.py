@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 from pydantic import ValidationError
 
 from app.schemas import QueryRequest
+from app.agents.roles import resolve_role
 from app.agents.job_eligibility.models import (
     AnomalyFlag,
     EligibilityCriteria,
@@ -80,6 +81,40 @@ def _markdown_cell(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ").strip()
 
 
+# Profile fields the eligibility rules read (same names as StudentProfile).
+_PROFILE_FIELDS = (
+    "cgpa", "branch", "active_backlogs", "graduation_year",
+    "tenth_percentage", "twelfth_percentage", "category", "experience_months",
+)
+_FIELD_LABELS = {
+    "cgpa": "CGPA",
+    "branch": "branch",
+    "active_backlogs": "active backlogs",
+    "graduation_year": "graduation year",
+    "tenth_percentage": "10th percentage",
+    "twelfth_percentage": "12th percentage",
+    "category": "category",
+    "experience_months": "experience (months)",
+}
+_WHAT_IF_FOOTER = (
+    "_Your official eligibility always uses the profile on record. To correct it, update your profile._"
+)
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except (TypeError, ValueError):
+        return str(left).strip().casefold() == str(right).strip().casefold()
+
+
+def _format_value(field_name: str, value: Any) -> str:
+    label = _FIELD_LABELS.get(field_name, field_name.replace("_", " "))
+    if isinstance(value, float):
+        value = f"{value:g}"
+    return f"{label} {value}"
+
+
 class JobEligibilityAgent:
     """Evaluate metadata jobs using profile data remembered per chat session.
 
@@ -106,13 +141,15 @@ class JobEligibilityAgent:
     SWITCH_MESSAGE = "Sure -- let's check your eligibility."
 
     async def run(self, req: QueryRequest) -> AsyncIterator[Any]:
+        role = resolve_role(req)
         state = get_or_create_session(req.sessionId)
+        state.role = role
         state.merge_metadata(req.meta_data)
 
         try:
             payload = self._parse_payload(req.user_query)
             if payload is not None:
-                async for chunk in self._dispatch(payload):
+                async for chunk in self._dispatch(payload, state, role):
                     yield chunk
                 return
 
@@ -125,30 +162,34 @@ class JobEligibilityAgent:
                         "type": "job_details",
                         "header_message": JOB_DETAILS_HEADER_MESSAGE,
                         "content": self._format_job_details(detail_job),
-                        "data": detail_job,
+                        "data": {"selected_job": detail_job},
                     }
                 else:
                     yield "I don't have a previously selected job in this chat yet. Ask me to check your eligibility first.\n"
                 return
 
             if self._is_audit_request(query):
-                async for chunk in self._run_llm_fallback(query, req, state):
+                async for chunk in self._run_llm_fallback(query, req, state, role):
                     yield chunk
                 return
 
-            async for chunk in self._run_metadata_check(query, req, state):
+            async for chunk in self._run_metadata_check(query, req, state, role):
                 yield chunk
-        except Exception as exc:
+        except Exception:
             logger.exception("[%s] job-eligibility agent failed", req.requestId)
-            yield f"Could not evaluate eligibility: {exc}\n"
+            yield "I couldn't evaluate eligibility right now. Please try again.\n"
+        finally:
+            # What-if values apply to the turn they were typed in only.
+            state.what_if = {}
 
     async def _run_metadata_check(
         self,
         query: str,
         req: QueryRequest,
         state: EligibilitySessionState,
+        role: str = "student",
     ) -> AsyncIterator[Any]:
-        validation_message = self._capture_profile_reply(query, state)
+        validation_message = self._capture_profile_reply(query, state, role)
         if validation_message:
             yield validation_message + "\n"
             return
@@ -169,7 +210,7 @@ class JobEligibilityAgent:
             return
 
         state.awaiting_field = None
-        student = self._student_from_state(state, req.sessionId)
+        student = self._student_from_profile(state.profile, req.sessionId)
         rows: List[tuple[Dict[str, Any], Any]] = []
         for job in selected_jobs:
             criteria = self._criteria_from_job(job)
@@ -180,8 +221,24 @@ class JobEligibilityAgent:
         state.last_job_id = str((eligible_rows or rows)[0][0]["job_id"])
         yield self._format_eligibility_table(rows, student.cgpa) + "\n"
 
-        for job, verdict in rows:
-            yield {
+        what_if_rows: Optional[List[tuple[Dict[str, Any], Any]]] = None
+        if state.what_if:
+            try:
+                hypothetical = self._student_from_profile({**state.profile, **state.what_if}, req.sessionId)
+            except (ValidationError, TypeError, ValueError, KeyError):
+                hypothetical = None
+            if hypothetical is not None:
+                what_if_rows = [
+                    (job, evaluate_eligibility(hypothetical, self._criteria_from_job(job))) for job, _ in rows
+                ]
+                yield self._format_what_if(state, what_if_rows) + "\n"
+
+        basis = self._basis(state, role)
+        if basis == "self_reported":
+            yield self._self_reported_note(state) + "\n"
+
+        for index, (job, verdict) in enumerate(rows):
+            result: Dict[str, Any] = {
                 "type": "eligibility_result",
                 "job": str(job["job_id"]),
                 "job_title": _job_title(job),
@@ -190,39 +247,96 @@ class JobEligibilityAgent:
                 "isEligible": verdict.rule_engine_eligible,
                 "status": "eligible" if verdict.rule_engine_eligible else "ineligible",
                 "explanation": verdict.explanation,
+                "basis": basis,
             }
+            if what_if_rows is not None:
+                result["what_if"] = {
+                    "isEligible": what_if_rows[index][1].rule_engine_eligible,
+                    "values": dict(state.what_if),
+                }
+            yield result
 
-    def _capture_profile_reply(self, query: str, state: EligibilitySessionState) -> Optional[str]:
-        text = query.strip()
+    @staticmethod
+    def _parse_profile_reply(text: str, awaiting_field: Optional[str]) -> tuple[List[tuple[str, Any]], Optional[str]]:
+        """``([(field, value), ...], error_message)`` -- parsing exactly as before."""
+        parsed: List[tuple[str, Any]] = []
         cgpa_match = re.search(r"\bcgpa\s*(?:is|=|:)?\s*(-?\d+(?:\.\d+)?)", text, re.IGNORECASE)
-        if state.awaiting_field == "cgpa" and not cgpa_match:
+        if awaiting_field == "cgpa" and not cgpa_match:
             cgpa_match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*", text)
         if cgpa_match:
             cgpa = float(cgpa_match.group(1))
             if not 0 <= cgpa <= 10:
-                state.awaiting_field = "cgpa"
-                return "CGPA must be between 0 and 10. Please enter a valid CGPA"
-            state.profile["cgpa"] = cgpa
+                return [], "CGPA must be between 0 and 10. Please enter a valid CGPA"
+            parsed.append(("cgpa", cgpa))
 
         backlog_match = re.search(r"(?:active\s+)?backlogs?\s*(?:is|are|=|:)?\s*(\d+)", text, re.IGNORECASE)
-        if state.awaiting_field == "active_backlogs" and not backlog_match:
+        if awaiting_field == "active_backlogs" and not backlog_match:
             backlog_match = re.fullmatch(r"\s*(\d+)\s*", text)
         if backlog_match:
-            state.profile["active_backlogs"] = int(backlog_match.group(1))
+            parsed.append(("active_backlogs", int(backlog_match.group(1))))
 
         graduation_match = re.search(r"(?:graduation|passing)\s+year\s*(?:is|=|:)?\s*(20\d{2})", text, re.IGNORECASE)
-        if state.awaiting_field == "graduation_year" and not graduation_match:
+        if awaiting_field == "graduation_year" and not graduation_match:
             graduation_match = re.fullmatch(r"\s*(20\d{2})\s*", text)
         if graduation_match:
-            state.profile["graduation_year"] = int(graduation_match.group(1))
+            parsed.append(("graduation_year", int(graduation_match.group(1))))
 
         branch_match = re.search(r"\bbranch\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z &.-]{1,40})", text, re.IGNORECASE)
-        if state.awaiting_field == "branch" and not branch_match and re.fullmatch(r"[A-Za-z][A-Za-z &.-]{1,40}", text):
+        if awaiting_field == "branch" and not branch_match and re.fullmatch(r"[A-Za-z][A-Za-z &.-]{1,40}", text):
             branch_match = re.fullmatch(r"([A-Za-z][A-Za-z &.-]{1,40})", text)
         if branch_match:
-            state.profile["branch"] = branch_match.group(1).strip()
+            parsed.append(("branch", branch_match.group(1).strip()))
+        return parsed, None
 
+    def _capture_profile_reply(self, query: str, state: EligibilitySessionState, role: str = "student") -> Optional[str]:
+        """Route typed values: the record is never overwritten by what a student types."""
+        parsed, error = self._parse_profile_reply(query.strip(), state.awaiting_field)
+        if error:
+            state.awaiting_field = "cgpa"
+            return error
+        for field_name, value in parsed:
+            if role != "student":
+                state.self_reported[field_name] = value
+            elif _is_present(state.trusted_profile.get(field_name)):
+                if not _same_value(state.trusted_profile[field_name], value):
+                    state.what_if[field_name] = value
+            else:
+                state.self_reported[field_name] = value
         return None
+
+    @staticmethod
+    def _basis(state: EligibilitySessionState, role: str) -> str:
+        if role != "student":
+            return "entered"
+        return "self_reported" if EligibilityAgentHelpers.self_reported_fields(state) else "profile"
+
+    @staticmethod
+    def _self_reported_note(state: EligibilitySessionState) -> str:
+        fields = ", ".join(name.replace("_", " ") for name in EligibilityAgentHelpers.self_reported_fields(state))
+        return (
+            f"_Some values were typed by you and are not on your profile yet ({fields}). "
+            "Update your profile so placement checks use them._"
+        )
+
+    @staticmethod
+    def _format_what_if(state: EligibilitySessionState, rows: List[tuple[Dict[str, Any], Any]]) -> str:
+        typed = ", ".join(_format_value(name, value) for name, value in state.what_if.items())
+        recorded = ", ".join(
+            _format_value(name, state.trusted_profile.get(name)) for name in state.what_if
+            if _is_present(state.trusted_profile.get(name))
+        )
+        lines = [
+            "---",
+            f"**What-if (not your official result):** using the value(s) you typed — {typed} — "
+            f"instead of your profile on record ({recorded}):",
+            "| Job | Company | Result |",
+            "|---|---|---|",
+        ]
+        for job, verdict in rows:
+            outcome = "Would be eligible" if verdict.rule_engine_eligible else "Would still not be eligible"
+            lines.append(f"| {_markdown_cell(_job_title(job))} | {_markdown_cell(_company_name(job))} | {outcome} |")
+        lines.append(_WHAT_IF_FOOTER)
+        return "\n".join(lines)
 
     @staticmethod
     def _next_missing_profile_field(profile: Dict[str, Any], jobs: Iterable[Dict[str, Any]]) -> Optional[str]:
@@ -252,8 +366,7 @@ class JobEligibilityAgent:
         }[field]
 
     @staticmethod
-    def _student_from_state(state: EligibilitySessionState, session_id: str) -> StudentProfile:
-        profile = state.profile
+    def _student_from_profile(profile: Dict[str, Any], session_id: str) -> StudentProfile:
         return StudentProfile(
             student_id=str(profile.get("student_id") or session_id),
             name=str(profile.get("name") or "Student"),
@@ -419,12 +532,13 @@ class JobEligibilityAgent:
         query: str,
         req: QueryRequest,
         state: EligibilitySessionState,
+        role: str = "student",
     ) -> AsyncIterator[Any]:
         payload = await interpret_query(
             query,
-            metadata=req.meta_data,
+            metadata=self._llm_metadata(state),
             session_context={
-                "profile": state.profile,
+                "profile": self._llm_profile(state.profile),
                 "selected_job_ids": state.selected_job_ids,
                 "last_job_id": state.last_job_id,
             },
@@ -432,10 +546,34 @@ class JobEligibilityAgent:
         if payload is None:
             yield "I couldn't interpret that eligibility request right now. Please try again.\n"
             return
-        async for chunk in self._dispatch(payload):
+        async for chunk in self._dispatch(payload, state, role):
             yield chunk
 
-    async def _dispatch(self, payload: Dict[str, Any]) -> AsyncIterator[Any]:
+    @staticmethod
+    def _llm_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+        """Only the fields the rules read -- never contact details or credentials."""
+        keys = ("student_id", "name") + _PROFILE_FIELDS
+        return {key: profile[key] for key in keys if _is_present(profile.get(key))}
+
+    def _llm_metadata(self, state: EligibilitySessionState) -> Dict[str, Any]:
+        """Allow-listed context for the LLM (PYTHON.md §2.2: never tool_token or the whole meta_data)."""
+        job_keys = (
+            "job_id", "title", "job_title", "company_name", "minimumCgpa", "min_cgpa", "maximumBacklogs",
+            "max_backlogs", "eligibleBranches", "allowed_branches", "graduationYears", "allowed_graduation_years",
+        )
+        jobs = []
+        for job in list(state.jobs_by_id.values())[:50]:
+            entry = {key: job[key] for key in job_keys if key in job}
+            entry["company"] = _company_name(job)
+            jobs.append(entry)
+        return {"profile": self._llm_profile(state.profile), "jobs": jobs}
+
+    async def _dispatch(
+        self,
+        payload: Dict[str, Any],
+        state: Optional[EligibilitySessionState] = None,
+        role: str = "student",
+    ) -> AsyncIterator[Any]:
         action = (payload.get("action") or "").lower()
         if action == "clarify":
             yield (payload.get("message") or "Could you provide the missing eligibility information?") + "\n"
@@ -443,18 +581,37 @@ class JobEligibilityAgent:
             async for chunk in self._run_audit(payload):
                 yield chunk
         else:
-            async for chunk in self._run_structured_check(payload):
+            async for chunk in self._run_structured_check(payload, state, role):
                 yield chunk
 
-    async def _run_structured_check(self, payload: Dict[str, Any]) -> AsyncIterator[Any]:
+    async def _run_structured_check(
+        self,
+        payload: Dict[str, Any],
+        state: Optional[EligibilitySessionState] = None,
+        role: str = "student",
+    ) -> AsyncIterator[Any]:
         if not payload.get("student"):
             yield "I need the student's profile before I can check eligibility.\n"
             return
         if not payload.get("criteria"):
             yield "I need the job criteria before I can check eligibility.\n"
             return
+        student_data = dict(payload["student"]) if isinstance(payload["student"], dict) else {}
+        what_if: Dict[str, Any] = {}
+        typed_fields: List[str] = []
+        if role == "student" and state is not None:
+            # The record on file wins; contradicting typed values become a what-if.
+            for field_name in StudentProfile.model_fields:
+                trusted = state.trusted_profile.get(field_name)
+                typed = student_data.get(field_name)
+                if _is_present(trusted):
+                    if _is_present(typed) and not _same_value(typed, trusted) and field_name in _PROFILE_FIELDS:
+                        what_if[field_name] = typed
+                    student_data[field_name] = trusted
+                elif _is_present(typed) and field_name in _PROFILE_FIELDS:
+                    typed_fields.append(field_name)
         try:
-            student = StudentProfile(**payload["student"])
+            student = StudentProfile(**student_data)
             criteria = EligibilityCriteria(**payload["criteria"])
         except ValidationError as exc:
             yield self._missing_fields_prompt(exc) + "\n"
@@ -468,7 +625,24 @@ class JobEligibilityAgent:
                 yield f"- {conflict.description}\n"
             yield "\n"
         yield verdict.explanation + "\n"
-        yield {
+
+        what_if_verdict = None
+        if what_if:
+            try:
+                hypothetical = StudentProfile(**{**student_data, **what_if})
+                what_if_verdict = evaluate_eligibility(hypothetical, criteria)
+            except ValidationError:
+                what_if_verdict = None
+        if what_if_verdict is not None and state is not None:
+            state.what_if = dict(what_if)
+            job_stub = {"job_title": criteria.job_title, "company_name": payload["criteria"].get("company") or "—"}
+            yield self._format_what_if(state, [(job_stub, what_if_verdict)]) + "\n"
+
+        if role != "student":
+            basis = "entered"
+        else:
+            basis = "self_reported" if typed_fields else "profile"
+        result: Dict[str, Any] = {
             "type": "eligibility_result",
             "job": criteria.job_id,
             "job_title": criteria.job_title,
@@ -476,7 +650,11 @@ class JobEligibilityAgent:
             "isEligible": verdict.rule_engine_eligible,
             "status": "eligible" if verdict.rule_engine_eligible else "ineligible",
             "explanation": verdict.explanation,
+            "basis": basis,
         }
+        if what_if_verdict is not None:
+            result["what_if"] = {"isEligible": what_if_verdict.rule_engine_eligible, "values": dict(what_if)}
+        yield result
 
     async def _run_audit(self, payload: Dict[str, Any]) -> AsyncIterator[Any]:
         if not payload.get("criteria_list") and not payload.get("overrides"):
@@ -522,3 +700,15 @@ class JobEligibilityAgent:
             return f"I couldn't validate that eligibility data: {exc.errors()[0].get('msg', 'invalid value')}"
         fields = [_FRIENDLY_FIELD_NAMES.get(field, field.replace("_", " ")) for field in missing]
         return f"Please provide {', '.join(fields)}."
+
+
+class EligibilityAgentHelpers:
+    """Small pure helpers shared by the agent's static methods."""
+
+    @staticmethod
+    def self_reported_fields(state: EligibilitySessionState) -> List[str]:
+        """Typed fields that fill gaps in the record (so they shaped the verdict)."""
+        return [
+            name for name in _PROFILE_FIELDS
+            if _is_present(state.self_reported.get(name)) and not _is_present(state.trusted_profile.get(name))
+        ]

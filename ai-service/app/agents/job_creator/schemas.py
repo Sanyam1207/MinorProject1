@@ -86,7 +86,7 @@ class JobCreationChunk(AgentChunk):
     Attributes
     ----------
     header_message: One of ``mode:jobCreation:data``, ``mode:jobCreation:ready``,
-                    or ``mode:jobCreation:post``.
+                    ``mode:jobCreation:post`` or ``mode:jobCreation:error``.
     response:       Human-readable message for the chat panel.
     data:           Structured payload for the frontend's job-creation UI.
     is_end:         True only on the very last chunk of a request.
@@ -99,6 +99,7 @@ class JobCreationChunk(AgentChunk):
     HEADER_DATA = "mode:jobCreation:data"
     HEADER_READY = "mode:jobCreation:ready"
     HEADER_POST = "mode:jobCreation:post"
+    HEADER_ERROR = "mode:jobCreation:error"
 
     def __init__(
         self,
@@ -124,6 +125,7 @@ class JobCreationChunk(AgentChunk):
         response: str,
         job: JobData,
         missing_fields: List[str],
+        draft_id: str = "",
         session_id: str = "",
         is_end: bool = True,
     ) -> "JobCreationChunk":
@@ -136,6 +138,7 @@ class JobCreationChunk(AgentChunk):
                 "status": "data",
                 "job": job.to_dict(),
                 "missing_fields": missing_fields,
+                "draft_id": draft_id,
             },
             is_end=is_end,
             session_id=session_id,
@@ -147,6 +150,7 @@ class JobCreationChunk(AgentChunk):
         *,
         response: str,
         job: JobData,
+        draft_id: str = "",
         session_id: str = "",
         is_end: bool = True,
     ) -> "JobCreationChunk":
@@ -158,6 +162,7 @@ class JobCreationChunk(AgentChunk):
                 "type": "job_creation",
                 "status": "ready",
                 "job": job.to_dict(),
+                "draft_id": draft_id,
             },
             is_end=is_end,
             session_id=session_id,
@@ -169,6 +174,7 @@ class JobCreationChunk(AgentChunk):
         *,
         response: str,
         job: JobData,
+        draft_id: str = "",
         session_id: str = "",
         is_end: bool = True,
     ) -> "JobCreationChunk":
@@ -181,6 +187,7 @@ class JobCreationChunk(AgentChunk):
                 "action": "post_job",
                 "message": "The job is ready to be posted. Do you want to post it?",
                 "job": job.to_dict(),
+                "draft_id": draft_id,
                 "options": [
                     {"label": "Yes", "value": "confirm"},
                     {"label": "No", "value": "cancel"},
@@ -196,10 +203,15 @@ class JobCreationChunk(AgentChunk):
         *,
         response: str,
         job: JobData,
+        draft_id: str = "",
         session_id: str = "",
         is_end: bool = True,
     ) -> "JobCreationChunk":
-        """Chunk for the POST state — user confirmed, job is posted."""
+        """Chunk for the POST state — user confirmed, job is posted.
+
+        Node persists ``data.job`` keyed on ``data.draft_id`` (one document per
+        draft, so a second job in the same chat creates a new document).
+        """
         return cls(
             header_message=cls.HEADER_POST,
             response=response,
@@ -207,6 +219,7 @@ class JobCreationChunk(AgentChunk):
                 "type": "job_creation",
                 "status": "post",
                 "job": job.to_dict(),
+                "draft_id": draft_id,
             },
             is_end=is_end,
             session_id=session_id,
@@ -217,13 +230,14 @@ class JobCreationChunk(AgentChunk):
         cls,
         *,
         response: str,
+        draft_id: str = "",
         session_id: str = "",
     ) -> "JobCreationChunk":
         """Chunk for non-fatal errors / authorization failures."""
         return cls(
-            header_message=cls.HEADER_DATA,
+            header_message=cls.HEADER_ERROR,
             response=response,
-            data={"type": "error"},
+            data={"type": "error", "draft_id": draft_id},
             is_end=True,
             session_id=session_id,
         )

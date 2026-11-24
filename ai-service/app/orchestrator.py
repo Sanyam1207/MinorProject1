@@ -1,49 +1,53 @@
-"""Picks an agent for a query and streams its response straight back to the
-Node connection that asked for it (targeted by `sid`, that connection's own
-socket.io session id).
+"""Picks an agent for a query and streams its response back to the Node
+connection that asked for it (targeted by ``sid``).
 
-Reads `user_role` directly from `req.user_role` ('tpo' or 'student'), defaulting to 'student'
-if missing or invalid, formats human-readable Markdown response preambles for the left side of the UI,
-and formats structured job objects for the right side UI `data` containing strictly:
-- title
-- company_name
-- job_type
-- salary
-- experience
-- job_domain
-- application_url
-- isEligible (included ONLY when user is a student)
+Routing is deterministic and role-aware (``app/agents/roles.py``): every agent
+declares ``ROUTING_RULES``; the router scores them, restricted to the modes the
+caller's role may use. When nothing matches, the scores tie, or a forbidden
+agent clearly owns the request, the **copilot** answers (there is no
+``mode:none`` dead end any more).
+
+Invariant: every accepted query gets exactly ONE payload with ``isEnd: true``,
+it is the last one, and nothing follows it -- whatever raises. The only
+exception is a task cancelled because Node disconnected (nothing is emitted).
+``ChunkEmitter`` enforces it; ``handle()`` guards the whole turn.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import socketio
 
 from app.agents import REGISTRY
-from app.agents.modes import AgentMode
-from app.agents.jobscrapper.job_fetched_header_message import JOB_FETCHED_HEADER_MESSAGE
-from app.agents.job_eligibility.job_eligiblity_header_message import JOB_ELIGIBILITY_HEADER_MESSAGE
-from app.agents.jobscrapper.models.job import Job
 from app.agents.base import AgentChunk
+from app.agents.confirm import classify_reply
+from app.agents.copilot import session as copilot_session
+from app.agents.modes import AgentMode
+from app.agents.roles import allowed_modes, is_mode_allowed, resolve_role
 from app.agents.routing import is_self_narration
+from app.agents.jobscrapper.formatter import format_job_for_data, format_jobs_markdown
+from app.agents.jobscrapper.job_fetched_header_message import JOB_FETCHED_HEADER_MESSAGE
+from app.agents.jobscrapper.models.job import Job
+from app.agents.job_eligibility.job_eligiblity_header_message import JOB_ELIGIBILITY_HEADER_MESSAGE
 from app.agents.resume_generator.schemas import RESUME_HEADER_MESSAGE
-from app.agents.resume_generator.schemas import ResumeChunk
-from app.agents.job_creator.schemas import JobCreationChunk
 from app.agents.pr_outreach.schemas import PROutreachChunk
 from app.agents.alumni_connect.schemas import AlumniConnectChunk
 from app.agents.gap_analysis.schemas import GapAnalysisChunk
 from app.agents.learning_recommendation.schemas import LearningRecommendationChunk
-from app.schemas import QueryRequest, PastMessage
-
-from app.agents.jobscrapper.formatter import format_job_for_data, format_jobs_markdown
+from app.agents.copilot.schemas import CopilotChunk, GENERIC_ERROR
+from app.schemas import QueryRequest
 
 JOB_CREATION_HEADER_MESSAGE = "mode:jobCreation:data"  # fallback; chunks carry their own header
+OWNING_AGENT_ERROR = "Something went wrong while handling that. Please try again."
+MISSING_END_TEXT = "I couldn't produce a response. Please try again."
 
 log = logging.getLogger("orchestrator")
 
-MODE_SWITCH_HEADERS = {
+MODE_SWITCH_HEADERS: Dict[AgentMode, str] = {
     AgentMode.JOBS: "mode:switch:jobs",
     AgentMode.RESUME: "mode:switch:resume",
     AgentMode.ELIGIBILITY: "mode:switch:job-eligibility",
@@ -53,34 +57,37 @@ MODE_SWITCH_HEADERS = {
     AgentMode.ALUMNI_CONNECT: "mode:switch:alumni-connect",
     AgentMode.GAP_ANALYSIS: "mode:switch:gap-analysis",
     AgentMode.LEARNING_RECOMMENDATION: "mode:switch:learning-recommendation",
+    AgentMode.COPILOT: "mode:switch:copilot",
 }
 
-# Header sent on the content chunks an agent actually streams back, once a
-# mode is active -- distinct from MODE_SWITCH_HEADERS, which only covers the
-# one-off "you're now in X mode" confirmation. Falls back to the jobs header
-# for any mode that doesn't have its own (kept as prior behaviour).
-CONTENT_HEADERS = {
+# Header for content an agent streams as plain strings / job dicts (agents that
+# yield AgentChunk objects carry their own headers).
+CONTENT_HEADERS: Dict[AgentMode, str] = {
     AgentMode.JOBS: JOB_FETCHED_HEADER_MESSAGE,
     AgentMode.RESUME: RESUME_HEADER_MESSAGE,
     AgentMode.ELIGIBILITY: JOB_ELIGIBILITY_HEADER_MESSAGE,
     AgentMode.JOB_CREATION: JOB_CREATION_HEADER_MESSAGE,
+    AgentMode.INTERVIEW: "text:mode:interview",
     AgentMode.PR_OUTREACH: PROutreachChunk.HEADER_IN_PROGRESS,
     AgentMode.ALUMNI_CONNECT: AlumniConnectChunk.HEADER_IN_PROGRESS,
     AgentMode.GAP_ANALYSIS: GapAnalysisChunk.HEADER_IN_PROGRESS,
     AgentMode.LEARNING_RECOMMENDATION: LearningRecommendationChunk.HEADER,
+    AgentMode.COPILOT: CopilotChunk.HEADER_ANSWER,
 }
+
+
+def switch_header(mode: AgentMode) -> str:
+    return MODE_SWITCH_HEADERS.get(mode, f"mode:switch:{mode.value}")
 
 
 def _extract_options(item: Any, header_message: str = "") -> Optional[List[str]]:
     """Extract list of string choices from an AgentChunk or payload dict."""
-    # 1. Direct options attribute on chunk object
     opts = getattr(item, "options", None)
     if opts and isinstance(opts, list):
         extracted = [str(o) for o in opts if o]
         if extracted:
             return extracted
 
-    # 2. Extract from item.data dict if present
     data = getattr(item, "data", None) if not isinstance(item, dict) else item.get("data")
     if isinstance(data, dict) and "options" in data:
         raw_opts = data["options"]
@@ -96,7 +103,6 @@ def _extract_options(item: Any, header_message: str = "") -> Optional[List[str]]
             if extracted:
                 return extracted
 
-    # 3. Direct options key on item dict
     if isinstance(item, dict) and "options" in item and isinstance(item["options"], list):
         extracted = []
         for opt in item["options"]:
@@ -109,58 +115,73 @@ def _extract_options(item: Any, header_message: str = "") -> Optional[List[str]]
         if extracted:
             return extracted
 
-    # 4. Fallback when header is button:options
     hdr = str(getattr(item, "header_message", None) or header_message or "")
     if hdr == "button:options" or hdr.startswith("button:options"):
         return [
             "I want to give a mock interview for this job",
             "I want to give an interview based on my profile",
         ]
-
     return None
 
-def _mode_scores(text: str) -> List[Tuple[AgentMode, int, int]]:
-    """Score *text* against every agent's own routing rules, best first."""
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+
+def _mode_scores(text: str, allowed: Optional[frozenset] = None) -> List[Tuple[AgentMode, int, int]]:
+    """Score *text* against every (allowed) agent's routing rules, best first (stable)."""
     scored: List[Tuple[AgentMode, int, int]] = []
     for mode in AgentMode:
+        if allowed is not None and mode not in allowed:
+            continue
         rules = getattr(REGISTRY.get(mode.value), "ROUTING_RULES", None)
         if rules is None:
             continue
-        total, strong = rules.score(text)
+        total, strong = rules.score(text or "")
         if total:
             scored.append((mode, total, strong))
     scored.sort(key=lambda item: item[1], reverse=True)
     return scored
 
 
-def route_query(text: str) -> Optional[AgentMode]:
+def route_query(text: str, role: Optional[str] = None) -> Optional[AgentMode]:
     """Pick the agent for a fresh request. Deterministic -- no API call.
 
-    Returns None when nothing matches, or when the two best candidates tie and
-    there is no honest way to choose between them.
+    None when nothing the role may use matches, when the two best allowed
+    candidates tie, or when a forbidden agent clearly owns the request.
+    ``role=None`` filters nothing.
     """
-    scored = _mode_scores(text or "")
-    if not scored:
+    all_scores = _mode_scores(text)
+    ok = all_scores if role is None else _mode_scores(text, allowed_modes(role))
+    if not ok:
         return None
-    if len(scored) > 1 and scored[0][1] == scored[1][1]:
-        log.info("ambiguous routing for %r: %s", (text or "")[:60],
-                 [(m.value, s) for m, s, _ in scored[:3]])
+    if len(ok) > 1 and ok[0][1] == ok[1][1]:
+        log.info("ambiguous routing for %r: %s", (text or "")[:60], [(m.value, s) for m, s, _ in ok[:3]])
         return None
-    return scored[0][0]
+    if ok[0][2] == 0 and all_scores and not is_mode_allowed(all_scores[0][0], role) and all_scores[0][2] > 0:
+        return None
+    return ok[0][0]
 
 
-def detect_switch(text: str, current_mode: AgentMode) -> Optional[AgentMode]:
-    """Decide whether *text* asks to leave *current_mode* for another agent.
+def denied_mode_for(text: str, role: str) -> Optional[AgentMode]:
+    """The forbidden mode that clearly owns *text* (strong hit, strictly best), else None."""
+    all_scores = _mode_scores(text)
+    if not all_scores:
+        return None
+    top_mode, top_total, top_strong = all_scores[0]
+    if is_mode_allowed(top_mode, role) or top_strong < 1:
+        return None
+    if len(all_scores) > 1 and all_scores[1][1] >= top_total:
+        return None
+    return top_mode
 
-    Deliberately stricter than `route_query`: leaving an active workflow needs
-    a STRONG match on the other agent's rules. A weak topic hit is not enough,
-    which is what stops an interview answer like "I built a job board" -- one
-    weak "job" -- from tearing down the interview.
-    """
-    # Someone describing their own work is answering, not instructing.
+
+def detect_switch(text: str, current_mode: AgentMode, role: Optional[str] = None) -> Optional[AgentMode]:
+    """Does *text* ask to leave *current_mode* for another allowed agent? Needs a STRONG hit."""
     if is_self_narration(text or ""):
         return None
-    for mode, _total, strong in _mode_scores(text or ""):
+    for mode, _total, strong in _mode_scores(text or "", allowed_modes(role)):
         if mode == current_mode:
             continue
         if strong:
@@ -175,77 +196,61 @@ def switch_message(mode: AgentMode) -> str:
     return getattr(agent, "SWITCH_MESSAGE", None) or f"Switching you to {mode.value}."
 
 
-async def resolve_mode(
-    req: QueryRequest,
-) -> tuple[Optional[AgentMode], bool, Optional[AgentMode], Optional[str]]:
-    """Decide which agent handles this turn.
+@dataclass(frozen=True)
+class RouteDecision:
+    mode: AgentMode                          # never None
+    emit_switch: bool                        # emit the mode:switch:* line before the agent runs
+    left_mode: Optional[AgentMode] = None    # agent being left (its on_mode_exit hook runs)
+    replacement_query: Optional[str] = None
+    denied_mode: Optional[AgentMode] = None  # hint for the copilot
+    reason: str = "routed"                   # copilot_pending | pending_switch | switch | sticky | routed | fallback
 
-    Returns ``(mode, is_explicit, left_mode, replacement_query)``:
 
-    * ``mode``        -- the agent to run, or None if nothing matched.
-    * ``is_explicit`` -- True when the UI's own mode is being continued, so no
-                         "switching you to X" line is emitted.
-    * ``left_mode``   -- set only when the user is being moved OUT of an active
-                         mode, so the caller can terminate that agent's session
-                         before the new one runs.
-    * ``replacement_query`` -- set when the switch is being completed a turn
-                         late (the user was asked to confirm), so the receiving
-                         agent gets the request they actually made instead of
-                         the word "yes".
+async def resolve_mode(req: QueryRequest, role: str) -> RouteDecision:
+    """Decide which agent handles this turn (PYTHON.md §3.4)."""
+    text = req.user_query or ""
+    sticky = AgentMode.from_name(req.mode_name) if req.mode_name else None
 
-    A UI-provided ``mode_name`` keeps the workflow locked for follow-up turns,
-    but is re-evaluated every turn: a user mid-interview who asks for something
-    another agent owns is released to that agent rather than being trapped.
-    """
-    if req.mode_name is not None:
-        current_mode = AgentMode.from_name(req.mode_name)
-        if current_mode is None:
-            return None, True, None, None
+    # 0. A pending copilot confirmation answered with a plain yes/no.
+    if (
+        sticky in (None, AgentMode.COPILOT)
+        and copilot_session.store.has_pending(req.sessionId)
+        and classify_reply(text) is not None
+    ):
+        return RouteDecision(AgentMode.COPILOT, False, reason="copilot_pending")
 
-        # The active agent may have asked the user to confirm a switch last
-        # turn and now be acting on their answer.
-        confirmed = await _agent_pending_switch(current_mode, req)
+    # 1. The UI's active mode, re-evaluated every turn.
+    if sticky is not None and is_mode_allowed(sticky, role):
+        confirmed = await _agent_pending_switch(sticky, req)
         if confirmed is not None:
-            target_mode, original_query = confirmed
-            if target_mode is not None and target_mode != current_mode:
-                return target_mode, False, current_mode, original_query
-
-        target_mode = detect_switch(req.user_query, current_mode)
-        if target_mode is not None:
-            decision = await _agent_release_decision(current_mode, req, target_mode)
+            target, original_query = confirmed
+            if target is not None and target != sticky and is_mode_allowed(target, role):
+                return RouteDecision(
+                    target, True, left_mode=sticky, replacement_query=original_query, reason="pending_switch"
+                )
+        target = detect_switch(text, sticky, role)
+        if target is not None:
+            decision = await _agent_release_decision(sticky, req, target)
             if decision == "release":
-                return target_mode, False, current_mode, None
-            if decision == "ask":
-                # The agent will put the question to the user on this turn; it
-                # keeps the session so nothing is lost either way.
-                log.info(
-                    "[%s] %s is asking the user before switching to %s",
-                    req.requestId, current_mode.value, target_mode.value,
-                )
-            else:
-                log.info(
-                    "[%s] %s declined to release the session for a switch to %s",
-                    req.requestId, current_mode.value, target_mode.value,
-                )
-            return current_mode, True, None, None
+                return RouteDecision(target, True, left_mode=sticky, reason="switch")
+            log.info("[%s] %s kept the session (%s) instead of switching to %s",
+                     req.requestId, sticky.value, decision, target.value)
+        return RouteDecision(
+            sticky, False, reason="sticky",
+            denied_mode=denied_mode_for(text, role) if sticky is AgentMode.COPILOT else None,
+        )
 
-        # "continue" and "none" both stay put: inside an active workflow almost
-        # every message is a continuation, and the agent itself is better placed
-        # to answer an off-topic one than a generic "I couldn't understand".
-        return current_mode, True, None, None
-
-    return route_query(req.user_query), False, None, None
+    # 2. Fresh routing (no mode, unknown mode, or a mode this role may not use).
+    best = route_query(text, role)
+    if best is None:
+        return RouteDecision(AgentMode.COPILOT, False, denied_mode=denied_mode_for(text, role), reason="fallback")
+    return RouteDecision(best, True, reason="routed")
 
 
 async def _agent_pending_switch(
     current_mode: AgentMode, req: QueryRequest
 ) -> Optional[tuple[Optional[AgentMode], str]]:
-    """Let the active agent complete a switch it already asked the user about.
-
-    Agents opt in with ``async def pending_switch(self, req)`` returning
-    ``(target_mode_name, original_query)`` once the user has confirmed, or None.
-    Checked before the router so a plain "yes" is not re-classified from scratch.
-    """
+    """Let the active agent complete a switch it already asked the user about."""
     agent = REGISTRY.get(current_mode.value)
     hook = getattr(agent, "pending_switch", None)
     if hook is None:
@@ -257,53 +262,37 @@ async def _agent_pending_switch(
         return None
     if not result:
         return None
-    target_name, original_query = result
+    try:
+        target_name, original_query = result
+    except (TypeError, ValueError):
+        return None
     return AgentMode.from_name(target_name), (original_query or req.user_query)
 
 
-async def _agent_release_decision(
-    current_mode: AgentMode, req: QueryRequest, target_mode: AgentMode
-) -> str:
-    """Ask the active agent what to do about losing its session to a switch.
+async def _agent_release_decision(current_mode: AgentMode, req: QueryRequest, target_mode: AgentMode) -> str:
+    """Ask the active agent whether it releases the session: release | hold | ask.
 
-    The router's switch verdict comes from an LLM, so it can misread a message
-    that merely mentions another agent's subject matter. An agent mid-workflow
-    knows better than the router whether this turn is really an exit, so it may
-    define ``async def should_release(self, req, target) -> str`` returning:
-
-    ``"release"`` switch now, ``"hold"`` stay put silently, or ``"ask"`` stay
-    put for one turn and put the question to the user.
-
-    Agents without the hook always release. A hook returning a bool is honoured
-    as release/hold.
+    Missing hook or any exception means release (a broken hook must never trap
+    the user). A bool is honoured as release/hold.
     """
     agent = REGISTRY.get(current_mode.value)
     hook = getattr(agent, "should_release", None)
     if hook is None:
         return "release"
     try:
-        decision = await hook(req, target_mode.value)
-    except TypeError:
-        decision = await hook(req)  # hook that takes no target
+        try:
+            decision = await hook(req, target_mode.value)
+        except TypeError:
+            decision = await hook(req)  # hook that takes no target
     except Exception:
-        log.exception(
-            "[%s] should_release failed for %s -- allowing the switch",
-            req.requestId, current_mode.value,
-        )
+        log.exception("[%s] should_release failed for %s -- allowing the switch", req.requestId, current_mode.value)
         return "release"
-
     if isinstance(decision, bool):
         return "release" if decision else "hold"
     return decision if decision in ("release", "hold", "ask") else "release"
 
 
 def _agent_error_chunk(agent: Any, message: str, session_id: str) -> Optional[AgentChunk]:
-    """Ask a chunk-owning agent for its own terminal error chunk.
-
-    Each agent knows the ``data`` shape its frontend panel expects on failure,
-    so the orchestrator asks rather than hardcoding one per agent. Falls back
-    to None if the agent has no factory or it raises.
-    """
     factory = getattr(agent, "error_chunk", None)
     if factory is None:
         return None
@@ -315,12 +304,6 @@ def _agent_error_chunk(agent: Any, message: str, session_id: str) -> Optional[Ag
 
 
 async def _terminate_mode(left_mode: AgentMode, req: QueryRequest) -> Optional[str]:
-    """Tell the agent being left that it is losing control of this session.
-
-    Agents opt in by defining ``async def on_mode_exit(self, req)``. It may
-    return a short notice ("I've ended your interview") that is prepended to the
-    mode-switch line; agents without the hook are simply left alone.
-    """
     agent = REGISTRY.get(left_mode.value)
     hook = getattr(agent, "on_mode_exit", None)
     if hook is None:
@@ -333,93 +316,132 @@ async def _terminate_mode(left_mode: AgentMode, req: QueryRequest) -> Optional[s
     return notice.strip() if isinstance(notice, str) and notice.strip() else None
 
 
+# ---------------------------------------------------------------------------
+# Emission
+# ---------------------------------------------------------------------------
+
+
+class ChunkEmitter:
+    """Single exit to the socket; guarantees one terminal chunk, last."""
+
+    def __init__(self, sio: Any, sid: str, request_id: str, session_id: str) -> None:
+        self.sio = sio
+        self.sid = sid
+        self.request_id = request_id
+        self.session_id = session_id
+        self.ended = False
+        self.last_payload: Optional[dict] = None
+
+    async def emit(self, payload: dict) -> None:
+        if self.ended:
+            log.warning("[%s] dropping a chunk emitted after isEnd (%s)", self.request_id, payload.get("header_message"))
+            return
+        payload["requestId"] = self.request_id
+        await self.sio.emit("response", payload, to=self.sid)
+        self.last_payload = payload
+        self.ended = bool(payload.get("isEnd"))
+
+    async def terminal_error(self, message: str = GENERIC_ERROR) -> None:
+        if self.ended:
+            return
+        await self.emit({
+            "requestId": self.request_id,
+            "sessionId": self.session_id,
+            "header_message": CopilotChunk.HEADER_ERROR,
+            "response": message,
+            "data": {
+                "type": "copilot", "phase": "error", "message": message,
+                "tool_calls": [], "ui_actions": [], "source": "system",
+            },
+            "isEnd": True,
+        })
+
+    async def finalize_missing_end(self) -> None:
+        if self.ended:
+            return
+        if self.last_payload is None:
+            await self.terminal_error(MISSING_END_TEXT)
+            return
+        final = dict(self.last_payload)
+        final["isEnd"] = True
+        await self.emit(final)
+
+
 async def handle(req: QueryRequest, sio: socketio.AsyncServer, sid: str) -> None:
-    """Run the chosen agent and stream `response` events back to `sid` in real-time."""
-    mode, is_explicit, left_mode, replacement_query = await resolve_mode(req)
+    """Run one query to completion; exactly one terminal chunk unless cancelled."""
+    out = ChunkEmitter(sio, sid, req.requestId, req.sessionId)
+    try:
+        await _run(req, out)
+    except asyncio.CancelledError:
+        raise  # Node disconnected: emit nothing
+    except Exception:
+        log.exception("[%s] orchestrator failure", req.requestId)
+        await out.terminal_error()
+    else:
+        if not out.ended:
+            await out.finalize_missing_end()
 
-    # A switch confirmed a turn late: run the new agent against the request the
-    # user actually made, not the "yes" that approved it.
-    if replacement_query and replacement_query != req.user_query:
-        req = req.model_copy(update={"user_query": replacement_query})
 
-    if mode is None or mode.value not in REGISTRY:
-        log.warning(
-            "[%s] no agent matched (mode=%r) for query: %r",
-            req.requestId, mode, req.user_query,
-        )
-        await sio.emit(
-            "response",
-            {
-                "requestId": req.requestId,
-                "header_message": "mode:none",
-                "response": (
-                    "I couldn't figure out what you're asking for. Try something like "
-                    "\"find me software jobs in Bangalore\" or \"help me build my resume\"."
-                ),
-                "data": [],
-                "isEnd": True,
-            },
-            to=sid,
-        )
-        return
+async def _run(req: QueryRequest, out: ChunkEmitter) -> None:
+    role = resolve_role(req)
+    decision = await resolve_mode(req, role)
+    mode = decision.mode
 
-    # Being moved out of an active mode: stop that agent before the new one
-    # starts, so a half-finished workflow isn't left running behind the user.
+    # A switch confirmed a turn late: the new agent gets the request the user
+    # actually made, not the "yes" that approved it.
+    if decision.replacement_query and decision.replacement_query != req.user_query:
+        req = req.model_copy(update={"user_query": decision.replacement_query})
+
+    agent = REGISTRY.get(mode.value)
+    if agent is None:
+        log.error("[%s] no agent registered for %s -- using the copilot", req.requestId, mode.value)
+        mode = AgentMode.COPILOT
+        agent = REGISTRY[mode.value]
+
+    if mode is not AgentMode.COPILOT:
+        copilot_session.store.clear(req.sessionId)  # confirmations live for one turn
+
     exit_notice: Optional[str] = None
-    if left_mode is not None:
-        exit_notice = await _terminate_mode(left_mode, req)
-        log.info(
-            "[%s] leaving %s -> %s (rerouted)", req.requestId, left_mode.value, mode.value
-        )
+    if decision.left_mode is not None:
+        exit_notice = await _terminate_mode(decision.left_mode, req)
+        log.info("[%s] leaving %s -> %s (%s)", req.requestId, decision.left_mode.value, mode.value, decision.reason)
 
-    if not is_explicit:
-        response_text = switch_message(mode)
+    if decision.emit_switch:
+        text = switch_message(mode)
         if exit_notice:
-            response_text = f"{exit_notice} {response_text}"
-        await sio.emit(
-            "response",
-            {
-                "requestId": req.requestId,
-                "header_message": MODE_SWITCH_HEADERS[mode],
-                "response": response_text,
-                "data": [],
-                "isEnd": False,
-            },
-            to=sid,
-        )
+            text = f"{exit_notice} {text}"
+        await out.emit({
+            "sessionId": req.sessionId,
+            "header_message": switch_header(mode),
+            "response": text,
+            "data": [],
+            "isEnd": False,
+        })
 
-    agent = REGISTRY[mode.value]
+    if decision.denied_mode is not None:
+        meta = dict(req.meta_data or {})
+        meta["routing"] = {"denied_mode": decision.denied_mode.value, "role": role}
+        req = req.model_copy(update={"meta_data": meta})
+
+    log.info("[%s] routed to %s (role=%s, reason=%s)", req.requestId, mode.value, role, decision.reason)
+    await _run_agent(agent, mode, req, role, out)
+
+
+async def _run_agent(agent: Any, mode: AgentMode, req: QueryRequest, role: str, out: ChunkEmitter) -> None:
     header_message = CONTENT_HEADERS.get(mode, JOB_FETCHED_HEADER_MESSAGE)
-
-    # Extract user_role directly from QueryRequest ('tpo' or 'student'), defaulting to 'student' if missing/invalid
-    raw_role = getattr(req, "user_role", None) or ""
-    role = raw_role.strip().lower()
-    if role != "tpo":
-        role = "student"
-
-    log.info("[%s] routed to %s (user_role: %s -> evaluated role: %s)", req.requestId, agent.name, req.user_role, role)
+    # The caller's real role (student, teacher, tpo, admin, company, alumni) -- never collapsed.
+    list_role = role
 
     scraped_jobs: List[Dict[str, Any]] = []
     eligibility_results: List[Dict[str, Any]] = []
     status_header_parts: List[str] = []
-    text_markdown_buffer: str = ""
-    # Agents that yield AgentChunk objects own their own wire format: the
-    # orchestrator emits what they give it and adds no final chunk of its own.
-    owns_output: bool = bool(getattr(agent, "emits_own_chunks", False))
-    is_resume_agent: bool = (mode == AgentMode.RESUME)
-    is_job_creation_agent: bool = (mode == AgentMode.JOB_CREATION)
-    is_pr_outreach_agent: bool = (mode == AgentMode.PR_OUTREACH)
+    text_markdown_buffer = ""
+    owns_output = bool(getattr(agent, "emits_own_chunks", False))
 
     try:
         async for item in agent.run(req):
-            # ------------------------------------------------------------------
-            # Agent-owned chunk: emitted verbatim. The chunk carries its own
-            # header and data payload, so none of the job-accumulation logic
-            # below applies to it.
-            # ------------------------------------------------------------------
             if isinstance(item, AgentChunk):
-                payload = {
-                    "requestId": req.requestId,
+                payload: Dict[str, Any] = {
                     "sessionId": req.sessionId,
                     "header_message": item.header_message,
                     "response": item.response,
@@ -428,173 +450,104 @@ async def handle(req: QueryRequest, sio: socketio.AsyncServer, sid: str) -> None
                 }
                 if getattr(item, "confidence_score", None) is not None:
                     payload["confidence_score"] = item.confidence_score
-                extracted_options = _extract_options(item, item.header_message)
-                if extracted_options is not None:
-                    payload["options"] = extracted_options
-                await sio.emit(
-                    "response",
-                    payload,
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
+                options = _extract_options(item, item.header_message)
+                if options is not None:
+                    payload["options"] = options
+                await out.emit(payload)
+                if not out.ended:
+                    await asyncio.sleep(0.01)
                 continue
-            # ------------------------------------------------------------------
-            # If item is a Job Pydantic model
+
             if isinstance(item, Job):
-                job_dict = format_job_for_data(item.model_dump(), role=role)
-                scraped_jobs.append(job_dict)
-                response_md = format_jobs_markdown(scraped_jobs, role=role, status_header="".join(status_header_parts))
-
-                await sio.emit(
-                    "response",
-                    {
-                        "requestId": req.requestId,
-                        "header_message": header_message,
-                        "response": response_md,
-                        "data": list(scraped_jobs),
-                        "isEnd": False,
-                    },
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
-
-            # If item is a structured eligibility verdict from JobEligibilityAgent
-            # (checked before the generic job-dict branch below, since this
-            # dict also carries a "job" key -- a job id, not a job listing --
-            # which would otherwise mis-match that branch).
+                scraped_jobs.append(format_job_for_data(item.model_dump(), role=list_role))
+                await out.emit({
+                    "header_message": header_message,
+                    "response": format_jobs_markdown(scraped_jobs, role=list_role, status_header="".join(status_header_parts)),
+                    "data": list(scraped_jobs),
+                    "isEnd": False,
+                })
             elif isinstance(item, dict) and item.get("type") == "eligibility_result":
                 eligibility_results.append(item)
-                response_md = "".join(status_header_parts) + text_markdown_buffer
-
-                await sio.emit(
-                    "response",
-                    {
-                        "requestId": req.requestId,
-                        "header_message": header_message,
-                        "response": response_md,
-                        "data": list(eligibility_results),
-                        "isEnd": False,
-                    },
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
-
+                await out.emit({
+                    "header_message": header_message,
+                    "response": "".join(status_header_parts) + text_markdown_buffer,
+                    "data": list(eligibility_results),
+                    "isEnd": False,
+                })
             elif isinstance(item, dict) and (item.get("type") == "job_details" or "header_message" in item):
-                custom_header = item.get("header_message", "mode:jobparser:jobdetails")
-                header_message = custom_header
-                content = item.get("content") or item.get("text") or ""
-                text_markdown_buffer += content
-
-                await sio.emit(
-                    "response",
-                    {
-                        "requestId": req.requestId,
-                        "header_message": custom_header,
-                        "response": text_markdown_buffer,
-                        "data": item.get("data", list(scraped_jobs)),
-                        "isEnd": False,
-                    },
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
-           
-            # If item is a dict containing job data
+                header_message = item.get("header_message", "mode:jobparser:jobdetails")
+                text_markdown_buffer += item.get("content") or item.get("text") or ""
+                await out.emit({
+                    "header_message": header_message,
+                    "response": text_markdown_buffer,
+                    "data": item.get("data", list(scraped_jobs)),
+                    "isEnd": False,
+                })
             elif isinstance(item, dict) and ("title" in item or "job" in item or "company" in item):
                 raw_dict = item.get("job", item)
-                job_dict = format_job_for_data(raw_dict, role=role)
-                scraped_jobs.append(job_dict)
-                response_md = format_jobs_markdown(scraped_jobs, role=role, status_header="".join(status_header_parts))
-
-                await sio.emit(
-                    "response",
-                    {
-                        "requestId": req.requestId,
-                        "header_message": header_message,
-                        "response": response_md,
-                        "data": list(scraped_jobs),
-                        "isEnd": False,
-                    },
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
-
-            # If item is a text chunk or status string
+                scraped_jobs.append(format_job_for_data(raw_dict, role=list_role))
+                await out.emit({
+                    "header_message": header_message,
+                    "response": format_jobs_markdown(scraped_jobs, role=list_role, status_header="".join(status_header_parts)),
+                    "data": list(scraped_jobs),
+                    "isEnd": False,
+                })
             elif isinstance(item, str):
                 if not scraped_jobs:
                     status_header_parts.append(item)
                     response_md = "".join(status_header_parts)
                 else:
                     text_markdown_buffer += item
-                    response_md = format_jobs_markdown(scraped_jobs, role=role, status_header="".join(status_header_parts))
-
-                await sio.emit(
-                    "response",
-                    {
-                        "requestId": req.requestId,
-                        "header_message": header_message,
-                        "response": response_md,
-                        "data": list(scraped_jobs),
-                        "isEnd": False,
-                    },
-                    to=sid,
-                )
-                await asyncio.sleep(0.01)
-
-    except Exception as exc:
-        log.exception("[%s] agent failed", req.requestId)
-        if owns_output:
-            chunk = _agent_error_chunk(agent, f"Something went wrong: {exc}", req.sessionId)
-            await sio.emit(
-                "response",
-                {
-                    "requestId": req.requestId,
-                    "sessionId": req.sessionId,
-                    "header_message": chunk.header_message if chunk else header_message,
-                    "response": chunk.response if chunk else f"Something went wrong: {exc}",
-                    "data": chunk.data if chunk else {"type": "error"},
-                    "isEnd": True,
-                },
-                to=sid,
-            )
-        else:
-            fallback_md = format_jobs_markdown(scraped_jobs, role=role, status_header="".join(status_header_parts)) if scraped_jobs else (text_markdown_buffer or str(exc))
-            await sio.emit(
-                "response",
-                {
-                    "requestId": req.requestId,
-                    "header_message": JOB_FETCHED_HEADER_MESSAGE,
-                    "response": fallback_md,
+                    response_md = format_jobs_markdown(scraped_jobs, role=list_role, status_header="".join(status_header_parts))
+                await out.emit({
+                    "header_message": header_message,
+                    "response": response_md,
                     "data": list(scraped_jobs),
-                    "isEnd": True,
-                },
-                to=sid,
+                    "isEnd": False,
+                })
+            else:
+                continue
+            await asyncio.sleep(0.01)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("[%s] agent %s failed", req.requestId, getattr(agent, "name", mode.value))
+        if out.ended:
+            return
+        if owns_output:
+            chunk = _agent_error_chunk(agent, OWNING_AGENT_ERROR, req.sessionId)
+            await out.emit({
+                "sessionId": req.sessionId,
+                "header_message": chunk.header_message if chunk else header_message,
+                "response": chunk.response if chunk else OWNING_AGENT_ERROR,
+                "data": chunk.data if chunk else {"type": "error"},
+                "isEnd": True,
+            })
+        else:
+            fallback_md = (
+                format_jobs_markdown(scraped_jobs, role=list_role, status_header="".join(status_header_parts))
+                if scraped_jobs else ("".join(status_header_parts) + text_markdown_buffer) or OWNING_AGENT_ERROR
             )
+            await out.emit({
+                "header_message": header_message,
+                "response": fallback_md,
+                "data": list(scraped_jobs),
+                "isEnd": True,
+            })
         return
 
-    # Final emit when agent finishes
-    # Resume and Job Creation agents handle their own final isEnd=True chunk.
     if owns_output:
-        log.info("[%s] %s done", req.requestId, agent.name)
-        return
-
-    if is_pr_outreach_agent:
-        log.info("[%s] pr-outreach agent done", req.requestId)
+        log.info("[%s] %s done", req.requestId, getattr(agent, "name", mode.value))
         return
 
     if scraped_jobs:
-        final_md = format_jobs_markdown(scraped_jobs, role=role, status_header="".join(status_header_parts))
+        final_md = format_jobs_markdown(scraped_jobs, role=list_role, status_header="".join(status_header_parts))
     else:
         final_md = "".join(status_header_parts) + text_markdown_buffer
-
-    await sio.emit(
-        "response",
-        {
-            "requestId": req.requestId,
-            "header_message": header_message,
-            "response": final_md,
-            "data": list(scraped_jobs) if scraped_jobs else list(eligibility_results),
-            "isEnd": True,
-        },
-        to=sid,
-    )
+    await out.emit({
+        "header_message": header_message,
+        "response": final_md,
+        "data": list(scraped_jobs) if scraped_jobs else list(eligibility_results),
+        "isEnd": True,
+    })
     log.info("[%s] done (%d jobs, role=%s)", req.requestId, len(scraped_jobs), role)

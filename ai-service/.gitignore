@@ -3,6 +3,7 @@ __pycache__/
 .env
 .venv/
 venv/
+.pytest_cache/
 streamlit_app.py
 test_console.py
 temp_app/
