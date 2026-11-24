@@ -112,14 +112,15 @@ const TYPE_META = {
 
 function getResourcesForTopics(skillGaps = [], topics = [], role = "") {
   const keys = new Set();
-  const normalize = (s) => s?.toLowerCase().trim() || "";
+  const normalize = (value) => (typeof value === "string" ? value.toLowerCase().trim() : "");
 
-  // Match skill gaps and topics against library keys
+  // Match skill gaps and topics against library keys. Empty terms are ignored:
+  // "" is contained in every key, so an empty role used to match every section.
   const allTerms = [
-    ...skillGaps.map(normalize),
-    ...topics.map((t) => normalize(t?.topic || t)),
+    ...(Array.isArray(skillGaps) ? skillGaps : []).map(normalize),
+    ...(Array.isArray(topics) ? topics : []).map((topic) => normalize(topic?.topic ?? topic)),
     normalize(role),
-  ];
+  ].filter((term) => term.length > 0);
 
   for (const term of allTerms) {
     for (const key of Object.keys(RESOURCE_LIBRARY)) {

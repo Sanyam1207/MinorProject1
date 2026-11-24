@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --test test/",
     "preview": "vite preview",
     "cert": "bash scripts/dev-cert.sh",
     "dev:lan": "VITE_DEV_HOST=lan VITE_DEV_HTTPS=true vite"

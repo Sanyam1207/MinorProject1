@@ -1,40 +1,158 @@
 import { createSelector, createSlice } from "@reduxjs/toolkit";
+import { APP_NAME } from "../lib/config.js";
+import { getJSON } from "../lib/storage.js";
+import { sessionEnded, sessionStarted } from "../features/auth/sessionSlice.js";
 
 const FALLBACK_ERROR_TEXT = "I am having trouble fetching live DB tool data at the moment. Please try asking again!";
+const INTERRUPTED = "Interrupted";
+const MAX_ARCHIVED_SESSIONS = 20;
+const MAX_INTERVIEW_HISTORY = 20;
 
-// ─── Local storage helpers ────────────────────────────────────────────────────
+const newId = () => globalThis.crypto?.randomUUID?.() ?? `id-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const nowIso = () => new Date().toISOString();
 
-const readStoredConversation = () => {
-  try {
-    const user = JSON.parse(localStorage.getItem("user"));
-    const identity = user?._id || user?.email || "guest";
-    const stored = JSON.parse(localStorage.getItem(`placement-ai-chat-history:${identity}`));
-    if (Array.isArray(stored)) return { messages: stored };
-    if (stored && Array.isArray(stored.messages)) return stored;
-  } catch {
-    // Start with a new conversation if persisted data is unavailable.
+// ─── Identity & storage keys ──────────────────────────────────────────────────
+
+/** Per-user storage identity: id, else email, else "guest". */
+export const chatIdentity = (user) => user?._id || user?.id || user?.email || "guest";
+export const chatHistoryKey = (identity) => `placement-ai-chat-history:${identity}`;
+export const interviewHistoryKey = (identity) => `interview-history:${identity}`;
+
+// ─── Message normalisation (hydration) ───────────────────────────────────────
+
+const normalizeToolCall = (call, index) => ({
+  id: String(call?.id ?? `call-${index}`),
+  name: typeof call?.name === "string" ? call.name : "tool",
+  args: call?.args && typeof call.args === "object" ? call.args : {},
+  status: ["running", "done", "error", "needs_confirmation"].includes(call?.status) ? call.status : "done",
+  summary: typeof call?.summary === "string" ? call.summary : null,
+  error: typeof call?.error === "string" ? call.error : call?.error ? String(call.error) : null,
+});
+
+const interruptToolCalls = (toolCalls) =>
+  Array.isArray(toolCalls)
+    ? toolCalls.map((call) => (call?.status === "running" ? { ...call, status: "error", error: INTERRUPTED } : call))
+    : toolCalls;
+
+/** Stored messages never pulse forever and never show a spinning tool call. */
+export const normalizeStoredMessage = (message) => {
+  if (!message || typeof message !== "object") return null;
+  const normalized = { ...message, streaming: false };
+  if (Array.isArray(message.toolCalls)) normalized.toolCalls = interruptToolCalls(message.toolCalls);
+  return normalized;
+};
+
+const normalizeMessages = (messages) =>
+  Array.isArray(messages) ? messages.map(normalizeStoredMessage).filter(Boolean) : [];
+
+const normalizeSessions = (sessions) =>
+  Array.isArray(sessions)
+    ? sessions
+      .filter((session) => session && typeof session === "object" && session.sessionId)
+      .map((session) => ({ ...session, messages: normalizeMessages(session.messages) }))
+      .slice(0, MAX_ARCHIVED_SESSIONS)
+    : [];
+
+const normalizeConversation = (stored) => {
+  if (Array.isArray(stored)) return { sessionId: newId(), messages: normalizeMessages(stored), sessions: [] };
+  if (stored && typeof stored === "object" && Array.isArray(stored.messages)) {
+    return {
+      ...stored,
+      sessionId: stored.sessionId || newId(),
+      messages: normalizeMessages(stored.messages),
+      sessions: normalizeSessions(stored.sessions),
+    };
   }
-  return {};
+  return { sessionId: newId(), messages: [], sessions: [] };
 };
 
-const storedConversation = readStoredConversation();
-
-const readInterviewHistory = () => {
-  try {
-    const stored = JSON.parse(localStorage.getItem("interview-history") || "[]");
-    return Array.isArray(stored) ? stored : [];
-  } catch {
-    return [];
+/** Interview history for a user; falls back to the old global key on first read. */
+export const readInterviewHistory = (identity) => {
+  const own = getJSON(interviewHistoryKey(identity));
+  if (Array.isArray(own)) return own.slice(0, MAX_INTERVIEW_HISTORY);
+  if (identity !== "guest") {
+    const legacy = getJSON("interview-history");
+    if (Array.isArray(legacy)) return legacy.slice(0, MAX_INTERVIEW_HISTORY);
   }
+  return [];
 };
 
-const saveInterviewHistory = (history) => {
-  try {
-    localStorage.setItem("interview-history", JSON.stringify(history.slice(0, 20)));
-  } catch { /* ignore storage errors */ }
+/** Stored conversation (+ interview history) for a user, normalised for hydration. */
+export const readConversationForUser = (user) => {
+  const identity = chatIdentity(user);
+  return {
+    ...normalizeConversation(getJSON(chatHistoryKey(identity))),
+    interviewHistory: readInterviewHistory(identity),
+  };
 };
+
+const readStoredConversation = () => readConversationForUser(getJSON("user"));
+
+// ─── Persistence shape (used by the quota-safe persister in store/index.js) ──
+
+const MAX_TEXT_CHARS = 20000;
+const MAX_INLINE_RESUME_CHARS = 50000;
+
+const trimMessageForStorage = (message) => {
+  const trimmed = { ...message, streaming: false };
+  if (typeof trimmed.text === "string" && trimmed.text.length > MAX_TEXT_CHARS) {
+    trimmed.text = `${trimmed.text.slice(0, MAX_TEXT_CHARS)}\n\n…`;
+  }
+  if (Array.isArray(trimmed.uiActions)) {
+    trimmed.uiActions = trimmed.uiActions.map(({ id, panel, params }) => ({ id, panel, params }));
+  }
+  return trimmed;
+};
+
+const trimJourney = (journey, keepResume) => {
+  const resume = typeof journey?.resume === "string" ? journey.resume : "";
+  return {
+    selectedJob: journey?.selectedJob ?? null,
+    resume: keepResume && resume.length <= MAX_INLINE_RESUME_CHARS ? resume : "",
+  };
+};
+
+const trimInterviewWorkspace = (workspace) => {
+  if (!workspace || typeof workspace !== "object") return undefined;
+  const rest = { ...workspace };
+  delete rest.dbJobs;
+  delete rest.resources;
+  return rest;
+};
+
+const STORAGE_LEVELS = [
+  { sessions: MAX_ARCHIVED_SESSIONS, messages: 200, keepResume: true },
+  { sessions: 5, messages: 80, keepResume: false },
+  { sessions: 0, messages: 30, keepResume: false },
+];
+
+/**
+ * Serializable chat snapshot for localStorage. `level` 0..2 = progressively
+ * smaller (used after a QuotaExceededError). LaTeX, interview job lists and
+ * one-shot UI payloads never go to storage.
+ */
+export function chatStorageSnapshot(aiChat, level = 0) {
+  const limits = STORAGE_LEVELS[Math.min(Math.max(level, 0), STORAGE_LEVELS.length - 1)];
+  return {
+    sessionId: aiChat.sessionId,
+    messages: aiChat.messages.slice(-limits.messages).map(trimMessageForStorage),
+    sessions: aiChat.sessions.slice(0, limits.sessions).map((session) => ({
+      ...session,
+      messages: (session.messages || []).slice(-limits.messages).map(trimMessageForStorage),
+      interviewWorkspace: trimInterviewWorkspace(session.interviewWorkspace),
+      journey: trimJourney(session.journey, false),
+    })),
+    prOutreachWorkspace: aiChat.prOutreachWorkspace,
+    alumniWorkspace: aiChat.alumniWorkspace,
+    journey: trimJourney(aiChat.journey, limits.keepResume),
+  };
+}
+
+export const CHAT_STORAGE_LEVELS = STORAGE_LEVELS.length;
 
 // ─── Empty workspace factories ────────────────────────────────────────────────
+
+const emptyResumeWorkspace = () => ({ latexCode: "", status: "idle", pdfUrl: null, error: null, requestId: null, analysis: null });
 
 const emptyJobCreationWorkspace = () => ({
   status: "idle",
@@ -112,16 +230,64 @@ const emptyLearningWorkspace = () => ({
 
 const emptyJourney = () => ({ selectedJob: null, resume: "" });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Busy states that a terminal failure must release (requestFailed).
+const resetTransientWorkspaces = (state) => {
+  state.requests = {};
+  state.latestJobs = [];
+  state.latestAgentData = null;
+  state.latestUiTarget = null;
+  state.resumeWorkspace = emptyResumeWorkspace();
+  state.jobCreationWorkspace = emptyJobCreationWorkspace();
+  state.gapAnalysisWorkspace = emptyGapAnalysisWorkspace();
+  state.learningWorkspace = emptyLearningWorkspace();
+};
 
-const buildWelcomeMessage = (name = "Student") => ({
-  id: crypto.randomUUID(),
+const hydrateConversation = (state, conversation = {}) => {
+  state.sessionId = conversation.sessionId || state.sessionId || newId();
+  state.messages = normalizeMessages(conversation.messages);
+  state.sessions = normalizeSessions(conversation.sessions);
+  resetTransientWorkspaces(state);
+  state.prOutreachWorkspace = { ...emptyPROutreachWorkspace(), ...(conversation.prOutreachWorkspace || {}) };
+  state.alumniWorkspace = { ...emptyAlumniWorkspace(), ...(conversation.alumniWorkspace || {}) };
+  state.interviewWorkspace = { ...emptyInterviewWorkspace(), ...(conversation.interviewWorkspace || {}) };
+  state.journey = { ...emptyJourney(), ...(conversation.journey || {}) };
+  if (Array.isArray(conversation.interviewHistory)) {
+    state.interviewHistory = conversation.interviewHistory.slice(0, MAX_INTERVIEW_HISTORY);
+  }
+};
+
+// ─── Welcome message ─────────────────────────────────────────────────────────
+
+const WELCOME_OPTIONS = Object.freeze({
+  student: ["Show my attendance", "Find campus drives for me", "Tailor my resume for a job"],
+  teacher: ["Schedule DBMS tomorrow at 10am", "Start attendance for my next class", "Who is below 75% in my courses?"],
+  tpo: ["Show placement stats", "List active drives", "Offers awaiting response"],
+  admin: ["Show placement stats", "List active drives", "Offers awaiting response"],
+  company: ["List my drives"],
+  alumni: ["Show my mentorship requests"],
+});
+
+/** Accepts a name string or `{ name, role }`. */
+const toWelcomeArg = (arg) => {
+  if (arg && typeof arg === "object") return { name: arg.name || "there", role: arg.role || null };
+  return { name: typeof arg === "string" && arg.trim() ? arg.trim() : "there", role: null };
+};
+
+const buildWelcomeMessage = ({ name, role, id, createdAt }) => ({
+  id: id || newId(),
   sender: "bot",
-  text: `Hello ${name}! I am your AI Placement Assistant. How can I help you today?`,
+  text: `Hello ${name}! I'm your ${APP_NAME} copilot. How can I help?`,
   headerMessage: null,
   streaming: false,
-  createdAt: new Date().toISOString(),
+  createdAt: createdAt || nowIso(),
+  ...(WELCOME_OPTIONS[role] ? { options: [...WELCOME_OPTIONS[role]] } : {}),
 });
+
+const prepareWelcome = (arg) => ({
+  payload: { ...toWelcomeArg(arg), id: newId(), createdAt: nowIso(), sessionId: newId() },
+});
+
+// ─── Session archive ─────────────────────────────────────────────────────────
 
 const toSessionRecord = (state) => {
   const firstUserMessage = state.messages.find((message) => message.sender === "user");
@@ -130,9 +296,9 @@ const toSessionRecord = (state) => {
   return {
     sessionId: state.sessionId,
     title: firstUserMessage.text || "Untitled conversation",
-    createdAt: firstUserMessage.createdAt || new Date().toISOString(),
-    updatedAt: lastMessage?.createdAt || new Date().toISOString(),
-    messages: state.messages.map((message) => ({ ...message, streaming: false })),
+    createdAt: firstUserMessage.createdAt || lastMessage?.createdAt || null,
+    updatedAt: lastMessage?.createdAt || firstUserMessage.createdAt || null,
+    messages: state.messages.map((message) => normalizeStoredMessage(message)),
     prOutreachWorkspace: { ...state.prOutreachWorkspace },
     alumniWorkspace: { ...state.alumniWorkspace },
     interviewWorkspace: { ...state.interviewWorkspace },
@@ -143,98 +309,84 @@ const toSessionRecord = (state) => {
 const archiveCurrentSession = (state) => {
   const current = toSessionRecord(state);
   if (!current) return;
-  state.sessions = [current, ...state.sessions.filter((s) => s.sessionId !== current.sessionId)].slice(0, 30);
+  state.sessions = [current, ...state.sessions.filter((session) => session.sessionId !== current.sessionId)].slice(
+    0,
+    MAX_ARCHIVED_SESSIONS,
+  );
 };
 
-export const readConversationForUser = (user) => {
-  try {
-    const identity = user?._id || user?.email || "guest";
-    const stored = JSON.parse(localStorage.getItem(`placement-ai-chat-history:${identity}`));
-    if (Array.isArray(stored)) return { sessionId: crypto.randomUUID(), messages: stored };
-    if (stored && Array.isArray(stored.messages)) return stored;
-  } catch {
-    // Return a fresh conversation when stored history cannot be read.
+// ─── Copilot chunk (AGENT-TOOLS.md §6) ───────────────────────────────────────
+
+const applyCopilotChunk = (message, payload) => {
+  const data = payload.data && typeof payload.data === "object" ? payload.data : {};
+  const header = payload.header_message;
+  message.text = payload.response || data.message || message.text || FALLBACK_ERROR_TEXT;
+  if (Array.isArray(data.tool_calls)) message.toolCalls = data.tool_calls.map(normalizeToolCall);
+  else if (!Array.isArray(message.toolCalls)) message.toolCalls = [];
+  if (Array.isArray(data.ui_actions)) {
+    message.uiActions = data.ui_actions
+      .filter((action) => action && typeof action.panel === "string")
+      .map((action, index) => ({ id: String(action.id ?? index), panel: action.panel, params: action.params ?? {} }));
+  } else if (!Array.isArray(message.uiActions)) {
+    message.uiActions = [];
   }
-  return { sessionId: crypto.randomUUID(), messages: [] };
+  message.pending = header === "copilot:confirm" && data.pending && typeof data.pending === "object" ? data.pending : null;
+  message.copilotPhase = typeof data.phase === "string" ? data.phase : header.split(":")[1] || null;
+  const options = Array.isArray(payload.options) && payload.options.length > 0 ? payload.options : data.options;
+  if (Array.isArray(options) && options.length > 0) {
+    message.options = options.map((option) => (typeof option === "string" ? option : option?.label || option?.value || String(option)));
+  }
 };
 
 // ─── Slice ────────────────────────────────────────────────────────────────────
 
-const aiChatSlice = createSlice({
-  name: "aiChat",
-  initialState: {
-    sessionId: storedConversation.sessionId || crypto.randomUUID(),
-    messages: storedConversation.messages || [],
-    sessions: storedConversation.sessions || [],
+const readInitialState = () => {
+  const stored = readStoredConversation();
+  return {
+    sessionId: stored.sessionId || newId(),
+    messages: stored.messages || [],
+    sessions: stored.sessions || [],
     requests: {},
     connected: false,
     latestJobs: [],
     latestAgentData: null,
     latestUiTarget: null,
-    resumeWorkspace: {
-      latexCode: "",
-      status: "idle",
-      pdfUrl: null,
-      error: null,
-      requestId: null,
-      analysis: null,
-    },
+    resumeWorkspace: emptyResumeWorkspace(),
     jobCreationWorkspace: emptyJobCreationWorkspace(),
-    prOutreachWorkspace: {
-      ...emptyPROutreachWorkspace(),
-      ...(storedConversation.prOutreachWorkspace || {}),
-    },
-    alumniWorkspace: {
-      ...emptyAlumniWorkspace(),
-      ...(storedConversation.alumniWorkspace || {}),
-    },
-    interviewWorkspace: {
-      ...emptyInterviewWorkspace(),
-      ...(storedConversation.interviewWorkspace || {}),
-    },
+    prOutreachWorkspace: { ...emptyPROutreachWorkspace(), ...(stored.prOutreachWorkspace || {}) },
+    alumniWorkspace: { ...emptyAlumniWorkspace(), ...(stored.alumniWorkspace || {}) },
+    interviewWorkspace: { ...emptyInterviewWorkspace(), ...(stored.interviewWorkspace || {}) },
     gapAnalysisWorkspace: emptyGapAnalysisWorkspace(),
     learningWorkspace: emptyLearningWorkspace(),
-    interviewHistory: readInterviewHistory(),
-    journey: {
-      ...emptyJourney(),
-      ...(storedConversation.journey || {}),
-    },
-  },
+    interviewHistory: stored.interviewHistory || [],
+    journey: { ...emptyJourney(), ...(stored.journey || {}) },
+  };
+};
+
+const aiChatSlice = createSlice({
+  name: "aiChat",
+  initialState: readInitialState,
   reducers: {
     connectionChanged(state, action) {
       state.connected = Boolean(action.payload);
     },
 
-    conversationHydrated(state, action) {
-      state.sessionId = action.payload?.sessionId || crypto.randomUUID();
-      state.messages = action.payload?.messages || [];
-      state.sessions = action.payload?.sessions || [];
-      state.requests = {};
-      state.latestJobs = [];
-      state.latestAgentData = null;
-      state.latestUiTarget = null;
-      state.resumeWorkspace = { latexCode: "", status: "idle", pdfUrl: null, error: null, requestId: null, analysis: null };
-      state.jobCreationWorkspace = emptyJobCreationWorkspace();
-      state.prOutreachWorkspace = {
-        ...emptyPROutreachWorkspace(),
-        ...(action.payload?.prOutreachWorkspace || {}),
-      };
-      state.alumniWorkspace = {
-        ...emptyAlumniWorkspace(),
-        ...(action.payload?.alumniWorkspace || {}),
-      };
-      state.interviewWorkspace = {
-        ...emptyInterviewWorkspace(),
-        ...(action.payload?.interviewWorkspace || {}),
-      };
-      state.gapAnalysisWorkspace = emptyGapAnalysisWorkspace();
-      state.learningWorkspace = emptyLearningWorkspace();
-      state.journey = { ...emptyJourney(), ...(action.payload?.journey || {}) };
+    conversationHydrated: {
+      reducer(state, action) {
+        hydrateConversation(state, action.payload || {});
+      },
+      prepare(conversation) {
+        return { payload: { ...(conversation || {}), sessionId: conversation?.sessionId || newId() } };
+      },
     },
 
-    ensureWelcomeMessage(state, action) {
-      if (state.messages.length > 0) return;
-      state.messages.push(buildWelcomeMessage(action.payload));
+    /** Accepts a name string or `{ name, role }`; no-op when the chat already has messages. */
+    ensureWelcomeMessage: {
+      reducer(state, action) {
+        if (state.messages.length > 0) return;
+        state.messages.push(buildWelcomeMessage(action.payload));
+      },
+      prepare: prepareWelcome,
     },
 
     requestStarted(state, action) {
@@ -295,8 +447,7 @@ const aiChatSlice = createSlice({
         state.gapAnalysisWorkspace.requestId = requestId;
       }
       if (payload?.mode_name === "learning-recommendation") {
-        state.learningWorkspace.status =
-          state.learningWorkspace.selectedInterview ? "generating" : "idle";
+        state.learningWorkspace.status = state.learningWorkspace.selectedInterview ? "generating" : "idle";
         state.learningWorkspace.error = null;
         state.learningWorkspace.requestId = requestId;
       }
@@ -306,27 +457,32 @@ const aiChatSlice = createSlice({
       const payload = action.payload;
       const request = state.requests[payload.requestId];
       if (!request) return;
+      const header = typeof payload.header_message === "string" ? payload.header_message : null;
+      const isCopilot = Boolean(header?.startsWith("copilot:"));
 
       const message = state.messages.find((item) => item.id === request.assistantMessageId);
       if (message) {
-        const isResumeResponse =
-          request.modeName === "resume-generator" ||
-          payload.header_message === "resume_generator" ||
-          payload.header_message === "resume-generator";
-        if (isResumeResponse && payload.data?.type === "text") {
-          message.text += payload.response || "";
-        } else if (!isResumeResponse || payload.response) {
-          message.text = payload.response || message.text || FALLBACK_ERROR_TEXT;
+        if (isCopilot) {
+          applyCopilotChunk(message, payload);
+        } else {
+          // Resume-generator text chunks are DELTAS (appended); every other header is cumulative.
+          const isResumeResponse =
+            request.modeName === "resume-generator" || header === "resume_generator" || header === "resume-generator";
+          if (isResumeResponse && payload.data?.type === "text") {
+            message.text += payload.response || "";
+          } else if (!isResumeResponse || payload.response) {
+            message.text = payload.response || message.text || FALLBACK_ERROR_TEXT;
+          }
+          if (Array.isArray(payload.options) && payload.options.length > 0) {
+            message.options = payload.options;
+          } else if (header === "button:options" && Array.isArray(payload.data?.options)) {
+            message.options = payload.data.options.map((opt) =>
+              typeof opt === "string" ? opt : opt.label || opt.value || String(opt),
+            );
+          }
         }
-        message.headerMessage = payload.header_message || null;
+        message.headerMessage = header;
         message.streaming = !payload.isEnd;
-        if (Array.isArray(payload.options) && payload.options.length > 0) {
-          message.options = payload.options;
-        } else if (payload.header_message === "button:options" && Array.isArray(payload.data?.options)) {
-          message.options = payload.data.options.map((opt) =>
-            typeof opt === "string" ? opt : opt.label || opt.value || String(opt)
-          );
-        }
       }
 
       request.status = payload.isEnd ? "completed" : "streaming";
@@ -335,9 +491,13 @@ const aiChatSlice = createSlice({
       if (payload.data !== undefined) {
         state.latestAgentData = payload.data;
       }
+      if (isCopilot) {
+        state.latestUiTarget = "copilot";
+        return;
+      }
 
       // ── Resume generator ──
-      if (payload.header_message === "resume_generator" || payload.header_message === "resume-generator") {
+      if (header === "resume_generator" || header === "resume-generator") {
         state.latestUiTarget = "resume.generator";
         if (payload.data?.type === "latex") {
           if (state.resumeWorkspace.status !== "streaming") state.resumeWorkspace.latexCode = "";
@@ -353,19 +513,17 @@ const aiChatSlice = createSlice({
         } else if (payload.data?.type === "analysis") {
           state.resumeWorkspace.analysis = payload.data;
           state.resumeWorkspace.status = "analysis";
-          state.latestUiTarget =
-            payload.data.analysis_type === "gap" ? "resume.skill-gap" : "resume.ats-score";
+          state.latestUiTarget = payload.data.analysis_type === "gap" ? "resume.skill-gap" : "resume.ats-score";
         }
         if (payload.pdfUrl) state.resumeWorkspace.pdfUrl = payload.pdfUrl;
       }
 
       // ── Job creation ──
-      if (payload.header_message?.startsWith("mode:jobCreation:")) {
-        const headerStatus = payload.header_message.split(":").at(-1);
+      if (header?.startsWith("mode:jobCreation:")) {
+        const headerStatus = header.split(":").at(-1);
         state.latestUiTarget = "tpo.job-creator";
         state.jobCreationWorkspace.status =
-          payload.data?.status ||
-          (payload.data?.type === "confirmation" ? "confirmation" : headerStatus);
+          payload.data?.status || (payload.data?.type === "confirmation" ? "confirmation" : headerStatus);
         state.jobCreationWorkspace.job = payload.data?.job || state.jobCreationWorkspace.job;
         state.jobCreationWorkspace.missingFields = payload.data?.missing_fields || [];
         state.jobCreationWorkspace.awaitingConfirmation = payload.data?.type === "confirmation";
@@ -376,13 +534,13 @@ const aiChatSlice = createSlice({
       }
 
       // ── PR Outreach ──
-      if (payload.header_message === "mail:review" || payload.header_message === "pr_outreach_satisfied") {
+      if (header === "mail:review" || header === "pr_outreach_satisfied") {
         const draft = payload.data?.email || payload.data || {};
         state.latestUiTarget = "pr-outreach.composer";
         if (typeof draft.to === "string") state.prOutreachWorkspace.to = draft.to;
         if (typeof draft.subject === "string") state.prOutreachWorkspace.subject = draft.subject;
         if (typeof draft.body === "string") state.prOutreachWorkspace.body = draft.body;
-        if (payload.header_message === "pr_outreach_satisfied") {
+        if (header === "pr_outreach_satisfied") {
           state.prOutreachWorkspace.agentSatisfied = true;
           state.prOutreachWorkspace.status = "satisfied";
         } else {
@@ -397,30 +555,38 @@ const aiChatSlice = createSlice({
         }
         state.prOutreachWorkspace.error = null;
         state.prOutreachWorkspace.requestId = payload.requestId;
-        state.prOutreachWorkspace.lastSyncedAt = new Date().toISOString();
+        state.prOutreachWorkspace.lastSyncedAt = nowIso();
       }
 
-      // ── Jobs list ──
-      if (
-        payload.header_message === "mode:jobparser:jobslist" &&
-        Array.isArray(payload.data) &&
-        payload.data.length > 0
-      ) {
+      // ── Jobs list / details / wishlist ──
+      if (header === "mode:jobparser:jobslist" && Array.isArray(payload.data) && payload.data.length > 0) {
         state.latestJobs = payload.data;
         state.latestUiTarget = "student.jobs";
       }
-      if (payload.header_message === "mode:jobparser:jobdetails" && payload.data?.selected_job) {
-        state.journey.selectedJob = payload.data.selected_job;
+      if (header === "mode:jobparser:jobdetails") {
+        const data = payload.data;
+        state.journey.selectedJob =
+          data?.selected_job ??
+          (data?.type === "job_details" ? data.job : data?.title ? data : state.journey.selectedJob);
+      }
+      if (
+        header === "mode:jobparser:addjob:wishlist" &&
+        payload.data?.type === "wishlist" &&
+        payload.data.ok &&
+        payload.data.job_id
+      ) {
+        const saved = state.latestJobs.find((job) => String(job?.id ?? job?._id ?? "") === String(payload.data.job_id));
+        if (saved) saved.application_status = payload.data.status ?? saved.application_status ?? null;
       }
 
       // ── Alumni ──
-      if (payload.header_message === "alumni:matches" && Array.isArray(payload.data)) {
+      if (header === "alumni:matches" && Array.isArray(payload.data)) {
         state.latestUiTarget = "alumni.matches";
         state.alumniWorkspace.matches = payload.data;
         state.alumniWorkspace.status = "matches";
         state.alumniWorkspace.requestId = payload.requestId;
       }
-      if (payload.header_message === "alumni:request-review") {
+      if (header === "alumni:request-review") {
         state.latestUiTarget = "alumni.request";
         state.alumniWorkspace.draft = payload.data || null;
         state.alumniWorkspace.status = "review";
@@ -429,7 +595,7 @@ const aiChatSlice = createSlice({
         state.alumniWorkspace.sendError = null;
         state.alumniWorkspace.requestId = payload.requestId;
       }
-      if (payload.header_message === "alumni:resume-share-review") {
+      if (header === "alumni:resume-share-review") {
         state.latestUiTarget = "alumni.resume-share";
         state.alumniWorkspace.resumeShareDraft = payload.data || null;
         state.alumniWorkspace.resumeShareReviewed = true;
@@ -437,12 +603,12 @@ const aiChatSlice = createSlice({
         state.alumniWorkspace.resumeShareError = null;
         state.alumniWorkspace.requestId = payload.requestId;
       }
-      if (payload.header_message === "alumni_connect_completed") {
+      if (header === "alumni_connect_completed") {
         state.alumniWorkspace = emptyAlumniWorkspace();
       }
 
       // ── Interview ──
-      if (payload.header_message === "button:options" && payload.data?.type === "options") {
+      if (header === "button:options" && payload.data?.type === "options") {
         state.latestUiTarget = "student.mock-interview";
         state.interviewWorkspace = {
           ...emptyInterviewWorkspace(),
@@ -451,7 +617,7 @@ const aiChatSlice = createSlice({
           requestId: payload.requestId,
         };
       }
-      if (payload.header_message === "select:job:db") {
+      if (header === "select:job:db") {
         state.latestUiTarget = "student.mock-interview";
         state.interviewWorkspace.status = "awaiting-job";
         state.interviewWorkspace.error = null;
@@ -460,7 +626,7 @@ const aiChatSlice = createSlice({
           state.interviewWorkspace.dbJobs = payload.data.jobs;
         }
       }
-      if (payload.header_message === "text:mode:interview") {
+      if (header === "text:mode:interview") {
         state.latestUiTarget = "student.mock-interview";
         state.interviewWorkspace.requestId = payload.requestId;
         if (payload.data?.type === "interview_intro") {
@@ -477,29 +643,24 @@ const aiChatSlice = createSlice({
           state.interviewWorkspace.error = payload.response || FALLBACK_ERROR_TEXT;
         }
       }
-      if (payload.header_message === "interview:end" && payload.data?.type === "interview_report") {
+      if (header === "interview:end" && payload.data?.type === "interview_report") {
         state.latestUiTarget = "student.mock-interview";
         state.interviewWorkspace.status = "complete";
         state.interviewWorkspace.report = payload.data.report || null;
         state.interviewWorkspace.reason = payload.data.reason || null;
         state.interviewWorkspace.currentQuestion = "";
         state.interviewWorkspace.requestId = payload.requestId;
-        // Persist to interview history
-        if (payload.data.report) {
-          const historyEntry = {
-            id: crypto.randomUUID(),
-            completedAt: new Date().toISOString(),
-            report: payload.data.report,
-          };
-          state.interviewHistory = [historyEntry, ...state.interviewHistory].slice(0, 20);
-          saveInterviewHistory(state.interviewHistory);
+        // Interview history is persisted per user by the store persister.
+        if (payload.data.report && !state.interviewHistory.some((entry) => entry.id === payload.requestId)) {
+          state.interviewHistory = [
+            { id: payload.requestId || newId(), completedAt: payload.data.report?.generated_at || nowIso(), report: payload.data.report },
+            ...state.interviewHistory,
+          ].slice(0, MAX_INTERVIEW_HISTORY);
         }
       }
-      // ── Gap Analysis workspace ─────────────────────────────────────
-      if (
-        payload.header_message === "mode:gapAnalysis:analysis" ||
-        payload.header_message === "mode:gapAnalysis:suggestions"
-      ) {
+
+      // ── Gap Analysis workspace ──
+      if (header === "mode:gapAnalysis:analysis" || header === "mode:gapAnalysis:suggestions") {
         state.latestUiTarget = "tpo.gap-analysis";
         state.gapAnalysisWorkspace.status = "ready";
         state.gapAnalysisWorkspace.requestId = payload.requestId;
@@ -514,15 +675,15 @@ const aiChatSlice = createSlice({
         }
         state.gapAnalysisWorkspace.error = null;
       }
-      if (payload.header_message === "mode:gapAnalysis:error") {
+      if (header === "mode:gapAnalysis:error") {
         state.latestUiTarget = "tpo.gap-analysis";
         state.gapAnalysisWorkspace.status = "error";
         state.gapAnalysisWorkspace.error = payload.response || "Something went wrong.";
         state.gapAnalysisWorkspace.requestId = payload.requestId;
       }
 
-      // ── Learning Recommendation workspace ────────────────────────
-      if (payload.header_message === "select:interview:db") {
+      // ── Learning Recommendation workspace ──
+      if (header === "select:interview:db") {
         state.latestUiTarget = "student.learning-recommendation";
         state.learningWorkspace.status = "select-interview";
         state.learningWorkspace.requestId = payload.requestId;
@@ -531,14 +692,14 @@ const aiChatSlice = createSlice({
           state.learningWorkspace.interviews = payload.data.interviews;
         }
       }
-      if (payload.header_message === "learning:recommendations") {
+      if (header === "learning:recommendations") {
         state.latestUiTarget = "student.learning-recommendation";
         state.learningWorkspace.status = "complete";
         state.learningWorkspace.recommendations = payload.data || null;
         state.learningWorkspace.requestId = payload.requestId;
         state.learningWorkspace.error = null;
       }
-      if (payload.header_message === "learning:recommendations-error") {
+      if (header === "learning:recommendations-error") {
         state.latestUiTarget = "student.learning-recommendation";
         state.learningWorkspace.status = "error";
         state.learningWorkspace.error = payload.response || "Unable to generate recommendations.";
@@ -557,8 +718,9 @@ const aiChatSlice = createSlice({
       state.interviewWorkspace.resources = action.payload || null;
     },
 
+    /** payload: { requestId, message?, header? } — terminal failure; releases every busy workspace. */
     requestFailed(state, action) {
-      const { requestId, message: errorMessage } = action.payload;
+      const { requestId, message: errorMessage, header } = action.payload || {};
       const request = state.requests[requestId];
       if (!request) return;
       request.status = "failed";
@@ -566,8 +728,10 @@ const aiChatSlice = createSlice({
       const message = state.messages.find((item) => item.id === request.assistantMessageId);
       if (message) {
         message.text = request.error;
-        message.headerMessage = null;
+        message.headerMessage = typeof header === "string" && header ? header : "error";
         message.streaming = false;
+        message.pending = null;
+        if (Array.isArray(message.toolCalls)) message.toolCalls = interruptToolCalls(message.toolCalls);
       }
       if (request.modeName === "resume-generator") {
         state.resumeWorkspace.status = "error";
@@ -626,7 +790,7 @@ const aiChatSlice = createSlice({
       state.prOutreachWorkspace.status = "sent";
       state.prOutreachWorkspace.sendStatus = "sent";
       state.prOutreachWorkspace.sendError = null;
-      state.prOutreachWorkspace.sentAt = new Date().toISOString();
+      state.prOutreachWorkspace.sentAt = nowIso();
       state.prOutreachWorkspace.messageId = action.payload?.messageId || null;
     },
 
@@ -707,21 +871,19 @@ const aiChatSlice = createSlice({
       state.alumniWorkspace.resumeShareError = null;
     },
 
-    newChatStarted(state, action) {
-      archiveCurrentSession(state);
-      state.sessionId = crypto.randomUUID();
-      state.messages = [buildWelcomeMessage(action.payload || "Student")];
-      state.requests = {};
-      state.latestJobs = [];
-      state.latestAgentData = null;
-      state.latestUiTarget = null;
-      state.resumeWorkspace = { latexCode: "", status: "idle", pdfUrl: null, error: null, requestId: null, analysis: null };
-      state.jobCreationWorkspace = emptyJobCreationWorkspace();
-      state.prOutreachWorkspace = emptyPROutreachWorkspace();
-      state.alumniWorkspace = emptyAlumniWorkspace();
-      state.interviewWorkspace = emptyInterviewWorkspace();
-      state.gapAnalysisWorkspace = emptyGapAnalysisWorkspace();
-      state.journey = emptyJourney();
+    /** Archives the current chat and starts a fresh persisted session (name string or `{name, role}`). */
+    newChatStarted: {
+      reducer(state, action) {
+        archiveCurrentSession(state);
+        state.sessionId = action.payload.sessionId;
+        state.messages = [buildWelcomeMessage(action.payload)];
+        resetTransientWorkspaces(state);
+        state.prOutreachWorkspace = emptyPROutreachWorkspace();
+        state.alumniWorkspace = emptyAlumniWorkspace();
+        state.interviewWorkspace = emptyInterviewWorkspace();
+        state.journey = emptyJourney();
+      },
+      prepare: prepareWelcome,
     },
 
     conversationOpened(state, action) {
@@ -733,45 +895,29 @@ const aiChatSlice = createSlice({
       archiveCurrentSession(state);
       state.sessions = state.sessions.filter((session) => session.sessionId !== targetSessionId);
       state.sessionId = target.sessionId;
-      state.messages = target.messages.map((message) => ({ ...message, streaming: false }));
-      state.requests = {};
-      state.latestJobs = [];
-      state.latestAgentData = null;
-      state.latestUiTarget = null;
-      state.resumeWorkspace = { latexCode: "", status: "idle", pdfUrl: null, error: null, requestId: null, analysis: null };
-      state.jobCreationWorkspace = emptyJobCreationWorkspace();
-      state.prOutreachWorkspace = {
-        ...emptyPROutreachWorkspace(),
-        ...(target.prOutreachWorkspace || {}),
-      };
-      state.alumniWorkspace = {
-        ...emptyAlumniWorkspace(),
-        ...(target.alumniWorkspace || {}),
-      };
-      state.interviewWorkspace = {
-        ...emptyInterviewWorkspace(),
-        ...(target.interviewWorkspace || {}),
-      };
-      state.gapAnalysisWorkspace = emptyGapAnalysisWorkspace();
+      state.messages = normalizeMessages(target.messages);
+      resetTransientWorkspaces(state);
+      state.prOutreachWorkspace = { ...emptyPROutreachWorkspace(), ...(target.prOutreachWorkspace || {}) };
+      state.alumniWorkspace = { ...emptyAlumniWorkspace(), ...(target.alumniWorkspace || {}) };
+      state.interviewWorkspace = { ...emptyInterviewWorkspace(), ...(target.interviewWorkspace || {}) };
       state.journey = { ...emptyJourney(), ...(target.journey || {}) };
     },
 
-    resetAIChat(state) {
-      state.sessionId = crypto.randomUUID();
-      state.messages = [];
-      state.sessions = [];
-      state.requests = {};
-      state.latestJobs = [];
-      state.latestAgentData = null;
-      state.latestUiTarget = null;
-      state.resumeWorkspace = { latexCode: "", status: "idle", pdfUrl: null, error: null, requestId: null, analysis: null };
-      state.jobCreationWorkspace = emptyJobCreationWorkspace();
-      state.prOutreachWorkspace = emptyPROutreachWorkspace();
-      state.alumniWorkspace = emptyAlumniWorkspace();
-      state.interviewWorkspace = emptyInterviewWorkspace();
-      state.gapAnalysisWorkspace = emptyGapAnalysisWorkspace();
-      state.learningWorkspace = emptyLearningWorkspace();
-      state.journey = emptyJourney();
+    resetAIChat: {
+      reducer(state, action) {
+        state.sessionId = action.payload.sessionId;
+        state.messages = [];
+        state.sessions = [];
+        resetTransientWorkspaces(state);
+        state.prOutreachWorkspace = emptyPROutreachWorkspace();
+        state.alumniWorkspace = emptyAlumniWorkspace();
+        state.interviewWorkspace = emptyInterviewWorkspace();
+        state.interviewHistory = [];
+        state.journey = emptyJourney();
+      },
+      prepare() {
+        return { payload: { sessionId: newId() } };
+      },
     },
 
     setLearningSelectedInterview(state, action) {
@@ -781,6 +927,26 @@ const aiChatSlice = createSlice({
     resetLearningWorkspace(state) {
       state.learningWorkspace = emptyLearningWorkspace();
     },
+  },
+  extraReducers: (builder) => {
+    builder
+      .addCase(sessionStarted, (state, action) => {
+        hydrateConversation(state, action.payload?.conversation || {});
+        state.interviewHistory = Array.isArray(action.payload?.conversation?.interviewHistory)
+          ? action.payload.conversation.interviewHistory.slice(0, MAX_INTERVIEW_HISTORY)
+          : [];
+      })
+      .addCase(sessionEnded, (state, action) => {
+        state.sessionId = action.payload?.chatSessionId || newId();
+        state.messages = [];
+        state.sessions = [];
+        resetTransientWorkspaces(state);
+        state.prOutreachWorkspace = emptyPROutreachWorkspace();
+        state.alumniWorkspace = emptyAlumniWorkspace();
+        state.interviewWorkspace = emptyInterviewWorkspace();
+        state.interviewHistory = [];
+        state.journey = emptyJourney();
+      });
   },
 });
 
@@ -822,9 +988,7 @@ export const {
 export const selectChatMessages = (state) => state.aiChat.messages;
 export const selectAIConnected = (state) => state.aiChat.connected;
 export const selectAILoading = (state) =>
-  Object.values(state.aiChat.requests).some(
-    (request) => request.status === "pending" || request.status === "streaming"
-  );
+  Object.values(state.aiChat.requests).some((request) => request.status === "pending" || request.status === "streaming");
 export const selectLatestJobs = (state) => state.aiChat.latestJobs;
 export const selectLatestUiTarget = (state) => state.aiChat.latestUiTarget;
 export const selectResumeWorkspace = (state) => state.aiChat.resumeWorkspace;
@@ -838,14 +1002,20 @@ export const selectInterviewHistory = (state) => state.aiChat.interviewHistory;
 export const selectStudentJourney = (state) => state.aiChat.journey;
 
 export const selectChatSessions = createSelector(
-  [(state) => state.aiChat],
-  (aiChat) => {
-    const current = toSessionRecord(aiChat);
-    const sessions = current
-      ? [current, ...aiChat.sessions.filter((session) => session.sessionId !== current.sessionId)]
-      : aiChat.sessions;
-    return sessions.slice(0, 30);
-  }
+  [
+    (state) => state.aiChat.sessionId,
+    (state) => state.aiChat.messages,
+    (state) => state.aiChat.sessions,
+    (state) => state.aiChat.prOutreachWorkspace,
+    (state) => state.aiChat.alumniWorkspace,
+    (state) => state.aiChat.interviewWorkspace,
+    (state) => state.aiChat.journey,
+  ],
+  (sessionId, messages, sessions, prOutreachWorkspace, alumniWorkspace, interviewWorkspace, journey) => {
+    const current = toSessionRecord({ sessionId, messages, prOutreachWorkspace, alumniWorkspace, interviewWorkspace, journey });
+    const list = current ? [current, ...sessions.filter((session) => session.sessionId !== current.sessionId)] : sessions;
+    return list.slice(0, MAX_ARCHIVED_SESSIONS + 1);
+  },
 );
 
 export default aiChatSlice.reducer;

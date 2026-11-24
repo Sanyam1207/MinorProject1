@@ -1,18 +1,45 @@
-# React + Vite
+# Matchy Campus — web app
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + Vite + Redux Toolkit + Tailwind 4. The copilot chat is on the left; the workspace on the right
+changes through **UI actions** (copilot tool results, legacy agent headers, notification clicks, deep links
+and the user's own clicks — see `docs/contracts/UI-ACTIONS.md` and `docs/contracts/FRONTEND.md`).
 
-Currently, two official plugins are available:
+## Run
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+cp .env.example .env      # defaults call the API on the same origin through the Vite proxy
+npm run dev               # http://localhost:5173 (proxies /api and /socket.io to VITE_DEV_BACKEND_URL)
+npm run build             # production bundle in dist/
+npm run lint
+npm test                  # node --test test/ (pure modules: workspace registry, UI actions, store, API clients)
+```
 
-## React Compiler
+Phones on the same Wi-Fi (camera QR scanner, geolocation and web push need HTTPS):
 
-The React Compiler is enabled on this template. See [this documentation](https://react.dev/learn/react-compiler) for more information.
+```bash
+npm run cert              # once: self-signed certificate in .cert/
+npm run dev:lan           # https://<LAN-IP>:5173
+```
 
-Note: This will impact Vite dev & build performances.
+## Environment (`.env`)
 
-## Expanding the ESLint configuration
+| Variable | Default | Meaning |
+|---|---|---|
+| `VITE_API_BASE_URL` | empty | Backend origin without `/api/v1`; empty = same origin |
+| `VITE_DEV_BACKEND_URL` | `http://127.0.0.1:8000` | Dev-proxy target for `/api` and `/socket.io` |
+| `VITE_GOOGLE_CLIENT_ID` | empty | Google sign-in client id (= backend `CLIENT_ID`); empty hides the button |
+| `VITE_APP_NAME` | `Matchy Campus` | Product name in the UI and tab title |
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Routes
+
+`/` app shell · `/attend?s=&t=` attendance QR deep link · `/present/:sessionId` presenter QR ·
+`/reset-password/:token[?invite=1]` · `/report-issue`. Production hosting must serve `index.html` for every
+non-asset path, and the backend `FRONTEND_URL` must be the origin phones open.
+
+## Layout
+
+- `src/workspace/` — panel registry (`panels.js`), role → modes (`modes.js`), `applyUiActions`/`openPanel`,
+  header routing, deep links, the workspace view and the lazy feature-panel registry (`featurePanels.js`).
+- `src/ui/` — shared stark UI kit (Panel, Modal, ConfirmDialog, Tabs, toasts, `useAsync`, formatters).
+- `src/features/` — auth/session, notifications (+ web push via `public/sw.js`), help, and the feature areas.
+- `src/lib/` — `http.js` (shared axios client), `socket.js`/`realtime.js`, `config.js`, `storage.js`, `api/*` clients.

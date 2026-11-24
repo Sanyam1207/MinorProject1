@@ -1,181 +1,282 @@
 import { useState } from "react";
-import { Building2, GraduationCap, Mail, Lock, LogIn, AlertTriangle, Sparkles, Users } from "lucide-react";
-import { api } from "../lib/api";
+import { useDispatch } from "react-redux";
+import { Link, useLocation } from "react-router-dom";
+import {
+  Building2,
+  Eye,
+  EyeOff,
+  Flag,
+  GraduationCap,
+  Info,
+  LoaderCircle,
+  Lock,
+  LogIn,
+  Mail,
+  Presentation,
+  ShieldCheck,
+  TriangleAlert,
+  Users,
+} from "lucide-react";
+import GoogleAuthButton from "./GoogleAuthButton.jsx";
+import ForgotPasswordForm from "../features/auth/ForgotPasswordForm.jsx";
+import { completeLogin } from "../features/auth/session.js";
+import { DEFAULT_AUTH_OPTIONS, getAuthOptions, loginOrRegister } from "../lib/api/auth.js";
+import { APP_INITIALS, APP_NAME, GOOGLE_CLIENT_ID } from "../lib/config.js";
+import { errorMessage } from "../lib/http.js";
+import { toastInfo } from "../ui/toast.js";
+import { useAsync } from "../ui/useAsync.js";
+import { roleLabel } from "../workspace/modes.js";
 
-export default function AuthScreen({ onAuthSuccess }) {
+const ROLE_TABS = [
+  { id: "student", label: "Student", icon: GraduationCap },
+  { id: "teacher", label: "Faculty", icon: Presentation },
+  { id: "tpo", label: "TPO", icon: ShieldCheck },
+  { id: "alumni", label: "Alumni", icon: Users },
+  { id: "company", label: "Recruiter", icon: Building2 },
+];
+
+const EMAIL_LABEL = {
+  student: "College email address",
+  teacher: "Faculty email address",
+  tpo: "Approved TPO email",
+  alumni: "Alumni email address",
+  company: "Recruiter email address",
+};
+
+const PLACEHOLDER = {
+  student: "you@college.edu",
+  teacher: "you@college.edu",
+  tpo: "tpo@college.edu",
+  alumni: "you@example.com",
+  company: "you@company.com",
+};
+
+const FOOTER = {
+  student: "New student emails register automatically (your college domain must be registered).",
+  teacher: "Faculty accounts are created by your TPO — use the invite email to set your password.",
+  tpo: "First use registers the approved TPO • Later uses sign in to the same account",
+  alumni: "First use creates an unverified alumni profile • Verification will be added later",
+  company: "Recruiter accounts are created by the placement cell.",
+};
+
+const FRIENDLY_ERRORS = {
+  ACCOUNT_DISABLED: "This account has been deactivated. Contact your placement office.",
+  TEACHER_INVITE_REQUIRED: "Faculty accounts are created by your placement office. Ask your TPO to invite you.",
+  RECRUITER_INVITE_REQUIRED: "Recruiter accounts are created by the placement office.",
+  TEMP_PASSWORD_EXPIRED: "Your temporary password has expired. Ask your placement office for a new invite.",
+  TOO_MANY_ATTEMPTS: "Too many attempts. Wait a minute and try again.",
+  INVALID_CREDENTIALS: "Incorrect email or password.",
+  PASSWORD_NOT_SET: "This account signs in with Google. Use Continue with Google, or Forgot password to set a password.",
+  WEAK_PASSWORD: "Use a password with at least 8 characters.",
+  EMAIL_NOT_VERIFIED: "Your Google email is not verified.",
+  GOOGLE_NOT_CONFIGURED: "Google sign-in is not enabled on this server.",
+};
+
+const LEGACY_MISMATCH = /registered as an? (student|teacher|faculty|tpo|admin|company|recruiter|alumni) account/i;
+const ROLE_ALIAS = { faculty: "teacher", recruiter: "company" };
+
+/** → { message, mismatchRole } */
+const describeError = (error) => {
+  const code = error?.code;
+  let mismatchRole = null;
+  if (code === "ROLE_MISMATCH") mismatchRole = error?.details?.role ?? null;
+  const legacy = typeof error?.message === "string" ? error.message.match(LEGACY_MISMATCH) : null;
+  if (!mismatchRole && legacy) mismatchRole = ROLE_ALIAS[legacy[1].toLowerCase()] ?? legacy[1].toLowerCase();
+  if (mismatchRole === "admin") mismatchRole = "tpo";
+  const message =
+    (code && FRIENDLY_ERRORS[code]) ||
+    (code === "INVALID_DOMAIN" ? errorMessage(error, "Use an email on your college's registered domain.") : null) ||
+    errorMessage(error, "Sign-in failed. Please try again.");
+  return { message, mismatchRole: ROLE_TABS.some((tab) => tab.id === mismatchRole) ? mismatchRole : null };
+};
+
+/**
+ * Sign-in / registration screen (FRONTEND.md §6.3). Used for the whole app and
+ * in place by RequireAuth (the URL, e.g. an attendance QR link, is kept).
+ */
+export default function AuthScreen({ title, subtitle, notice, onAuthSuccess }) {
+  const dispatch = useDispatch();
+  const location = useLocation();
+  const [role, setRole] = useState("student");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [authRole, setAuthRole] = useState("student");
-  const [error, setError] = useState(null);
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [failure, setFailure] = useState(null); // { message, mismatchRole }
+  const [showForgot, setShowForgot] = useState(false);
 
-  // A known email logs in; a new IPU email creates an account and logs in.
-  const handleFormLogin = async (e) => {
-    e.preventDefault();
-    setError(null);
-    setLoading(true);
+  const optionsQuery = useAsync(() => getAuthOptions(), []);
+  const options = optionsQuery.data ?? DEFAULT_AUTH_OPTIONS;
+  const domains = options.collegeDomains.slice(0, 3).map((item) => `@${item.domain}`);
+  const showGoogle = Boolean(GOOGLE_CLIENT_ID) && options.google.enabled !== false;
+  const resetByEmail = options.passwordReset.emailEnabled !== false;
 
-    const trimmedEmail = email.trim().toLowerCase();
+  const switchRole = (nextRole) => {
+    setRole(nextRole);
+    setFailure(null);
+  };
 
-    if (authRole === "student" && !/^[^\s@]+@ipu\.ac\.in$/i.test(trimmedEmail)) {
-      setError("INVALID DOMAIN: Use your official IPU email ending with @ipu.ac.in");
-      setLoading(false);
-      return;
+  const finish = (user, session) => {
+    if (session?.roleAdjusted && user?.role && user.role !== role) {
+      toastInfo(`Signed in as ${roleLabel(user.role)} — that's how this email is registered.`);
     }
+    onAuthSuccess?.(user);
+  };
 
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    setFailure(null);
+    setLoading(true);
     try {
-      const data = await api.loginOrRegister({
-        email: trimmedEmail,
-        password,
-        role: authRole,
-      });
-
-      const authenticatedUser = data.data?.user || {
-        name: trimmedEmail.split("@")[0].toUpperCase().replace(".", " "),
-        email: trimmedEmail,
-        role: authRole,
-        branch: null,
-        cgpa: null
-      };
-
-      if (data.data?.accessToken) {
-        localStorage.setItem("token", data.data.accessToken);
-      }
-
-      onAuthSuccess(authenticatedUser);
-    } catch (err) {
-      const apiErrorMessage = err.response?.data?.message || err.message;
-      console.warn("Backend auth server error:", apiErrorMessage);
-      setError(`AUTHENTICATION ERROR: ${apiErrorMessage}`);
-    } finally {
+      const session = await loginOrRegister({ email, password, role });
+      const user = await dispatch(completeLogin(session));
+      finish(user, session);
+    } catch (error) {
+      setFailure(describeError(error));
       setLoading(false);
     }
   };
 
+  const reportHref = `/report-issue?from=${encodeURIComponent(`${location.pathname}${location.search}`)}`;
+
   return (
-    <div className="min-h-screen bg-[#f8fafc] text-black font-sans flex items-center justify-center p-4">
-
-      {/* High Contrast Stark Auth Card */}
-      <div className="w-full max-w-md card-stark bg-white p-6 space-y-6 border-2 border-black shadow-bold-lg">
-
-        {/* Brand Header */}
-        <div className="text-center space-y-1.5 border-b-2 border-black pb-4">
-          <div className="inline-block bg-black text-white font-black text-2xl px-3 py-1 border-2 border-black mb-1">
-            TNP.AI
-          </div>
-          <h1 className="font-extrabold text-xl uppercase tracking-tight">
-            IPU PLACEMENT PORTAL
-          </h1>
-          <p className="text-xs font-semibold text-gray-600">
-            Institutional Email Authentication
-          </p>
+    <div className="flex min-h-dvh items-center justify-center bg-[#f8fafc] p-4 text-black">
+      <div className="card-stark w-full max-w-md space-y-5 border-2 border-black p-5 shadow-bold-lg sm:p-6">
+        <div className="space-y-1.5 border-b-2 border-black pb-4 text-center">
+          <div className="mb-1 inline-block border-2 border-black bg-black px-3 py-1 text-2xl font-black text-white">{APP_INITIALS}</div>
+          <h1 className="text-xl font-extrabold uppercase tracking-tight">{title || APP_NAME}</h1>
+          <p className="text-xs font-semibold text-gray-600">{subtitle || "Placements · Attendance · Careers"}</p>
         </div>
 
-
-
-        {/* Error Alert Message */}
-        {error && (
-          <div className="bg-red-100 border-2 border-black p-3 text-xs font-bold text-black flex items-start gap-2 animate-fadeIn">
-            <AlertTriangle className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5" />
-            <div>{error}</div>
+        {notice && (
+          <div role="status" className="flex items-start gap-2 border-2 border-black bg-blue-50 p-3 text-xs font-bold">
+            <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+            <span>{notice}</span>
           </div>
         )}
 
-        {/* Authentication Form */}
-        <div className="space-y-4">
-
-          <div className="grid grid-cols-3 border-2 border-black bg-gray-100 p-1">
-            <button
-              type="button"
-              onClick={() => { setAuthRole("student"); setError(null); }}
-              className={`flex items-center justify-center gap-2 px-2 py-2 text-[10px] font-black uppercase ${authRole === "student" ? "bg-black text-white" : "bg-transparent text-black"}`}
-            >
-              <GraduationCap className="h-4 w-4" /> Student
-            </button>
-            <button
-              type="button"
-              onClick={() => { setAuthRole("tpo"); setError(null); }}
-              className={`flex items-center justify-center gap-2 px-2 py-2 text-[10px] font-black uppercase ${authRole === "tpo" ? "bg-black text-white" : "bg-transparent text-black"}`}
-            >
-              <Building2 className="h-4 w-4" /> College TPO
-            </button>
-            <button
-              type="button"
-              onClick={() => { setAuthRole("alumni"); setError(null); }}
-              className={`flex items-center justify-center gap-2 px-2 py-2 text-[10px] font-black uppercase ${authRole === "alumni" ? "bg-black text-white" : "bg-transparent text-black"}`}
-            >
-              <Users className="h-4 w-4" /> Alumni
-            </button>
+        {failure && (
+          <div role="alert" className="animate-fadeIn space-y-2 border-2 border-black bg-red-100 p-3 text-xs font-bold">
+            <div className="flex items-start gap-2">
+              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-red-700" aria-hidden="true" />
+              <span>{failure.message}</span>
+            </div>
+            {failure.mismatchRole && failure.mismatchRole !== role && (
+              <button type="button" onClick={() => switchRole(failure.mismatchRole)} className="btn-primary min-h-11 px-3 py-1.5 text-xs sm:min-h-0">
+                CONTINUE AS {roleLabel(failure.mismatchRole).toUpperCase()}
+              </button>
+            )}
           </div>
+        )}
 
-          <form onSubmit={handleFormLogin} className="space-y-4">
+        <div role="tablist" aria-label="Account type" className="grid grid-cols-3 gap-1 border-2 border-black bg-gray-100 p-1 sm:grid-cols-5">
+          {ROLE_TABS.map((tab) => {
+            const Icon = tab.icon;
+            const selected = role === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                onClick={() => switchRole(tab.id)}
+                className={`flex min-h-11 flex-col items-center justify-center gap-1 px-1 py-1.5 text-[10px] font-black uppercase sm:min-h-0 ${selected ? "bg-black text-white" : "text-black hover:bg-gray-200"}`}
+              >
+                <Icon className="h-4 w-4" aria-hidden="true" />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
 
-                {/* Email Input Field */}
-                <div>
-                  <label className="block text-xs font-extrabold uppercase mb-1">
-                    {authRole === "tpo" ? "APPROVED COLLEGE TPO EMAIL" : authRole === "alumni" ? "ALUMNI EMAIL ADDRESS" : "OFFICIAL IPU EMAIL ADDRESS"}
-                  </label>
-                  <div className="relative flex items-center">
-                    <Mail className="w-4 h-4 absolute left-3 text-gray-500 z-10 pointer-events-none" />
-                    <input
-                      type="email"
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
-                      required
-                      placeholder={authRole === "tpo" ? "tpo@college.edu" : authRole === "alumni" ? "alumni@example.com" : "student@ipu.ac.in"}
-                      className="input-stark w-full text-xs font-mono"
-                      style={{ paddingLeft: "2.6rem" }}
-                    />
-                  </div>
-                </div>
+        {showForgot ? (
+          <ForgotPasswordForm defaultEmail={email} onBack={() => setShowForgot(false)} />
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <label className="block">
+              <span className="mb-1 block text-xs font-extrabold uppercase">{EMAIL_LABEL[role]}</span>
+              <span className="relative flex items-center">
+                <Mail className="pointer-events-none absolute left-3 h-4 w-4 text-gray-500" aria-hidden="true" />
+                <input
+                  type="email"
+                  required
+                  autoComplete="email"
+                  inputMode="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder={PLACEHOLDER[role]}
+                  className="input-stark w-full pl-9 font-mono text-base sm:text-xs"
+                />
+              </span>
+              {role === "student" && domains.length > 0 && (
+                <span className="mt-1 block text-[10px] font-semibold text-gray-500">Use your college email ({domains.join(", ")} …)</span>
+              )}
+              {role === "teacher" && (
+                <span className="mt-1 block text-[10px] font-semibold text-gray-500">Use the temporary password from your invite.</span>
+              )}
+            </label>
 
-                {/* Password Input Field */}
-                <div>
-                  <label className="block text-xs font-extrabold uppercase mb-1">
-                    PASSWORD
-                  </label>
-                  <div className="relative flex items-center">
-                    <Lock className="w-4 h-4 absolute left-3 text-gray-500 z-10 pointer-events-none" />
-                    <input
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      required
-                      className="input-stark w-full text-xs font-mono"
-                      style={{ paddingLeft: "2.6rem" }}
-                    />
-                  </div>
-                </div>
-
+            <label className="block">
+              <span className="mb-1 block text-xs font-extrabold uppercase">Password</span>
+              <span className="relative flex items-center">
+                <Lock className="pointer-events-none absolute left-3 h-4 w-4 text-gray-500" aria-hidden="true" />
+                <input
+                  type={showPassword ? "text" : "password"}
+                  required
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  className="input-stark w-full pl-9 pr-10 font-mono text-base sm:text-xs"
+                />
                 <button
-                  type="submit"
-                  disabled={loading}
-                  className="btn-primary w-full justify-center py-2.5 text-xs font-extrabold tracking-wider cursor-pointer"
+                  type="button"
+                  onClick={() => setShowPassword((value) => !value)}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  className="absolute right-1 flex h-9 w-9 items-center justify-center text-gray-600 hover:text-black"
                 >
-                  {loading ? (
-                    <Sparkles className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <>
-                      <LogIn className="w-4 h-4" />
-                      <span>{authRole === "tpo" ? "CONTINUE AS TPO" : authRole === "alumni" ? "CONTINUE AS ALUMNI" : "CONTINUE AS STUDENT"}</span>
-                    </>
-                  )}
+                  {showPassword ? <EyeOff className="h-4 w-4" aria-hidden="true" /> : <Eye className="h-4 w-4" aria-hidden="true" />}
                 </button>
+              </span>
+            </label>
+
+            <button type="submit" disabled={loading} className="btn-primary min-h-11 w-full justify-center py-2.5 text-xs font-extrabold tracking-wider disabled:opacity-60">
+              {loading ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" /> : <LogIn className="h-4 w-4" aria-hidden="true" />}
+              <span>CONTINUE AS {roleLabel(role).toUpperCase()}</span>
+            </button>
+
+            <div className="text-center">
+              {resetByEmail ? (
+                <button type="button" onClick={() => setShowForgot(true)} className="text-[11px] font-black uppercase underline underline-offset-2">
+                  Forgot password?
+                </button>
+              ) : (
+                <p className="text-[11px] font-semibold text-gray-600">Forgot your password? Ask your placement office (TPO) to reset it.</p>
+              )}
+            </div>
           </form>
+        )}
 
+        {showGoogle && !showForgot && (
+          <div className="space-y-3">
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center" aria-hidden="true">
+                <div className="w-full border-t-2 border-black" />
+              </div>
+              <div className="relative flex justify-center text-[10px] font-black uppercase">
+                <span className="bg-white px-2 text-gray-600">OR</span>
+              </div>
+            </div>
+            <GoogleAuthButton role={role} onSuccess={finish} onError={(error) => setFailure(describeError(error))} />
+          </div>
+        )}
+
+        <div className="space-y-2 border-t border-gray-200 pt-3 text-center text-[10px] font-semibold text-gray-500">
+          <p>{FOOTER[role]}</p>
+          <Link to={reportHref} className="inline-flex items-center gap-1 font-black uppercase text-black underline underline-offset-2">
+            <Flag className="h-3 w-3" aria-hidden="true" /> Report an issue
+          </Link>
         </div>
-
-        {/* Footer info */}
-        <div className="text-[10px] text-center text-gray-500 font-semibold pt-2 border-t border-gray-200">
-          {authRole === "tpo"
-            ? "First use registers the approved TPO • Later uses sign in to the same account"
-            : authRole === "alumni"
-              ? "First use creates an unverified alumni profile • Verification will be added later"
-            : "New student emails are registered automatically • Existing emails are signed in"}
-        </div>
-
       </div>
-
     </div>
   );
 }

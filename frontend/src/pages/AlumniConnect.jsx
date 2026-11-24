@@ -558,6 +558,23 @@ function AlumniDashboard({ user }) {
       setError(errorText(e));
     }
   };
+  if (profile === undefined && error)
+    return (
+      <div role="alert" className="card-stark bg-red-50 p-8 text-center">
+        <div className="text-xs font-black uppercase">Couldn&apos;t load your alumni workspace</div>
+        <p className="mt-1 text-[11px] font-semibold text-gray-700">{error}</p>
+        <button
+          type="button"
+          onClick={() => {
+            setError("");
+            load();
+          }}
+          className="btn-primary mt-3 px-3 py-1.5 text-xs"
+        >
+          TRY AGAIN
+        </button>
+      </div>
+    );
   if (profile === undefined)
     return (
       <div className="card-stark bg-white p-10 text-center text-xs font-black">

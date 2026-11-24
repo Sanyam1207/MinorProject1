@@ -1,290 +1,203 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { Sparkles } from "lucide-react";
-import AccessDeniedView from "./components/AccessDeniedView";
-import AuthScreen from "./components/AuthScreen";
-import Chat from "./components/Chat";
-import HeaderBar from "./components/HeaderBar";
-import ProfileModal from "./components/ProfileModal";
-import SidebarDrawer from "./components/SidebarDrawer";
-import WelcomeModeSelect from "./components/WelcomeModeSelect";
-import { api } from "./lib/api";
-import { openAIConversation, runAIFeature } from "./services/aiRequestHandler";
-import {
-  clearAppContext,
-  setActiveFeature,
-  setActiveJobsTab,
-  setActiveResumeTool,
-  setAgentMode,
-  setUserContext,
-  setUserMode,
-} from "./store/appContextSlice";
-import {
-  conversationHydrated,
-  ensureWelcomeMessage,
-  readConversationForUser,
-  resetAIChat,
-  selectChatSessions,
-  selectInterviewWorkspace,
-  selectLatestJobs,
-} from "./store/aiChatSlice";
+import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { WifiOff } from "lucide-react";
+import AuthScreen from "./components/AuthScreen.jsx";
+import Chat from "./components/Chat.jsx";
+import HeaderBar from "./components/HeaderBar.jsx";
+import SidebarDrawer from "./components/SidebarDrawer.jsx";
+import ChangePasswordModal from "./features/auth/ChangePasswordModal.jsx";
+import RequireAuth from "./features/auth/RequireAuth.jsx";
+import { logout, refreshCurrentUser, userUpdated } from "./features/auth/session.js";
+import NotificationsBridge from "./features/notifications/NotificationsBridge.jsx";
+import { markRead } from "./features/notifications/thunks.js";
+import { openAIConversation, startNewAIChat } from "./services/aiRequestHandler.js";
+import { selectChatSessions } from "./store/aiChatSlice.js";
+import ErrorBoundary from "./ui/ErrorBoundary.jsx";
+import LoadingState from "./ui/LoadingState.jsx";
+import FeatureSlot from "./workspace/FeatureSlot.jsx";
+import MobilePaneSwitcher from "./workspace/MobilePaneSwitcher.jsx";
+import OverlayHost from "./workspace/OverlayHost.jsx";
+import WorkspaceView from "./workspace/WorkspaceView.jsx";
+import { parsePanelUrl, stripPanelParams } from "./workspace/deepLink.js";
+import { isFullHeightResumeTool } from "./workspace/panels.js";
+import { applyUiActions, openPanel, switchMode } from "./workspace/uiActions.js";
 
-const AdminMode = lazy(() => import("./pages/AdminMode"));
-const CompanyMode = lazy(() => import("./pages/CompanyMode"));
-const ResumeStudio = lazy(() => import("./pages/ResumeStudio"));
-const PROutreach = lazy(() => import("./pages/PROutreach"));
-const StudentMode = lazy(() => import("./pages/StudentMode"));
-const AlumniConnect = lazy(() => import("./pages/AlumniConnect"));
+const ResetPasswordPage = lazy(() => import("./features/auth/ResetPasswordPage.jsx"));
+const ReportIssuePage = lazy(() => import("./features/help/ReportIssuePage.jsx"));
 
-const LazyFallback = () => (
-  <div className="card-stark my-auto flex flex-col items-center justify-center gap-3 border-1.5 border-black bg-white p-10 text-center">
-    <Sparkles className="h-8 w-8 animate-spin text-black" />
-    <div className="text-xs font-black uppercase tracking-wider text-black">LAZY LOADING MODE MODULE...</div>
-  </div>
-);
+function FullPageLoader({ label = "LOADING…" }) {
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-[#f8fafc]">
+      <LoadingState label={label} />
+    </div>
+  );
+}
 
-export default function App() {
+/** Applies `/?panel=…&params=…&nid=…` once after sign-in, then removes only those keys (UI-ACTIONS.md §9). */
+function useDeepLinkOnce() {
+  const dispatch = useDispatch();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const handledRef = useRef(false);
+
+  useEffect(() => {
+    if (handledRef.current) return;
+    handledRef.current = true;
+    const link = parsePanelUrl(location.search);
+    if (link) {
+      applyUiActions([{ panel: link.panel, params: link.params }], { source: "deeplink" });
+      if (link.nid) dispatch(markRead(link.nid));
+      navigate({ pathname: location.pathname, search: stripPanelParams(location.search), hash: location.hash }, { replace: true });
+      return;
+    }
+    // Gmail OAuth returns to "/?gmail_connected=1": PR outreach consumes that parameter.
+    const query = new URLSearchParams(location.search);
+    if (query.has("gmail_connected") || query.has("gmail_error")) {
+      applyUiActions([{ panel: "pr-outreach" }], { source: "deeplink" });
+    }
+  }, [dispatch, location, navigate]);
+}
+
+/** The signed-in app: header, chat | workspace, overlays, drawer (FRONTEND.md §10). */
+function AuthenticatedShell() {
   const dispatch = useDispatch();
   const user = useSelector((state) => state.appContext.user);
   const activeMode = useSelector((state) => state.appContext.activeMode);
-  const activeFeature = useSelector((state) => state.appContext.activeFeature);
-  const activeJobsTab = useSelector((state) => state.appContext.activeJobsTab);
+  const activePanel = useSelector((state) => state.appContext.activePanel);
   const activeResumeTool = useSelector((state) => state.appContext.activeResumeTool);
+  const pane = useSelector((state) => state.appContext.mobilePane);
+  const offline = useSelector((state) => state.session.offline);
   const chatSessions = useSelector(selectChatSessions);
-  const latestJobs = useSelector(selectLatestJobs);
-  const interviewWorkspace = useSelector(selectInterviewWorkspace);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
 
-  const [isAuthenticated, setIsAuthenticated] = useState(
-    () => localStorage.getItem("isAuthenticated") === "true",
-  );
-  const [isModeChosen, setIsModeChosen] = useState(
-    () => localStorage.getItem("isModeChosen") === "true",
-  );
-  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
-  const [resumeScoreData, setResumeScoreData] = useState(null);
-  const [databaseJobs, setDatabaseJobs] = useState([]);
-  const [loadingDrives, setLoadingDrives] = useState(false);
-  const [showProfileModal, setShowProfileModal] = useState(false);
+  useDeepLinkOnce();
 
-  const setActiveTab = (feature) => dispatch(setActiveFeature(feature));
-
-  const handleAuthSuccess = (authenticatedUser) => {
-    const isTpo = authenticatedUser?.role === "tpo" || authenticatedUser?.role === "admin";
-    const initialMode = authenticatedUser?.role === "alumni" ? "alumni" : isTpo ? "tpo" : "student";
-    dispatch(conversationHydrated(readConversationForUser(authenticatedUser)));
-    dispatch(setUserContext(authenticatedUser));
-    dispatch(setUserMode(initialMode));
-    dispatch(ensureWelcomeMessage(authenticatedUser?.name || "Student"));
-    setIsAuthenticated(true);
-    setIsModeChosen(isTpo || initialMode === "alumni");
-    localStorage.setItem("isAuthenticated", "true");
-    localStorage.setItem("isModeChosen", String(isTpo || initialMode === "alumni"));
-    localStorage.setItem("activeMode", initialMode);
-    localStorage.setItem("user", JSON.stringify(authenticatedUser));
-  };
-
-  const handleModeSelect = (mode) => {
-    dispatch(setUserMode(mode));
-    dispatch(setAgentMode(mode === "pr_outreach" ? "pr_outreach" : mode === "alumni_connect" ? "alumni-connect" : null));
-    setActiveTab(null);
-    setIsModeChosen(true);
-    localStorage.setItem("activeMode", mode);
-    localStorage.setItem("isModeChosen", "true");
-  };
-
-  const handleModeSwitch = (mode) => {
-    dispatch(setUserMode(mode));
-    dispatch(setAgentMode(mode === "pr_outreach" ? "pr_outreach" : mode === "alumni_connect" ? "alumni-connect" : null));
-    setActiveTab(null);
-    localStorage.setItem("activeMode", mode);
-  };
-
-  const handleOpenInterview = () => {
-    dispatch(setUserMode("student"));
-    dispatch(setActiveFeature("mock-interview"));
-    dispatch(setAgentMode("ai-interviewer"));
-    localStorage.setItem("activeMode", "student");
-    if (interviewWorkspace.status === "idle" || interviewWorkspace.status === "error") {
-      dispatch(runAIFeature("mock-interview"));
-    }
-  };
-
-  const handleLogout = () => {
-    localStorage.removeItem("token");
-    localStorage.removeItem("isAuthenticated");
-    localStorage.removeItem("isModeChosen");
-    localStorage.removeItem("user");
-    setIsAuthenticated(false);
-    setIsModeChosen(false);
-    dispatch(clearAppContext());
-    dispatch(resetAIChat());
-    setResumeScoreData(null);
-    setDatabaseJobs([]);
-  };
-
-  const fetchStudentDashboardData = async () => {
-    setLoadingDrives(true);
-    try {
-      const [scoreResult, jobsResult] = await Promise.allSettled([
-        api.getResumeScore(),
-        api.getJobs(),
-      ]);
-
-      if (scoreResult.status === "fulfilled") setResumeScoreData(scoreResult.value);
-      if (jobsResult.status === "fulfilled") {
-        const jobs = jobsResult.value.data || jobsResult.value.jobs || [];
-        setDatabaseJobs(jobs.map((job) => ({
-          _id: job._id,
-          companyName: job.company?.name || job.companyName || "Unknown Company",
-          companyLogo: job.companyLogo || null,
-          roleTitle: job.title || "Available Role",
-          jdText: job.description || "No job description provided.",
-          packageLpa: job.packageLpa || job.salary || "Not specified",
-          location: job.location || "Not specified",
-          skillsRequired: job.skillsRequired || job.skills || [],
-          applicationUrl: job.applicationUrl || null,
-          isEligible: true,
-          deadline: job.deadline || job.applicationDeadline || null,
-          driveDate: job.driveDate || null,
-        })));
-      }
-    } catch (error) {
-      console.error("Dashboard fetch error:", error);
-    } finally {
-      setLoadingDrives(false);
-    }
-  };
-
-  useEffect(() => {
-    // Initial remote dashboard hydration intentionally updates local loading/data state.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (isAuthenticated) fetchStudentDashboardData();
-  }, [isAuthenticated]);
-
-  const aiMatchedJobs = latestJobs.map((job, index) => ({
-    _id: `live-job-${index}`,
-    companyName: job["company name"] || job.company_name || job.companyName || "Unknown Company",
-    roleTitle: job.title || job.job_type || job.job_domain || "Role",
-    packageLpa: job.salary || "N/A",
-    isEligible: job.isEligible ?? true,
-    eligibilityReason: job.isEligible === false ? "Not Eligible based on profile" : "",
-    jdText: job.description || job.requirements || `Experience: ${job.experience || "Not specified"} | Domain: ${job.job_domain || "Not specified"}`,
-    requirements: job.requirements || "",
-    skillsRequired: Array.isArray(job.skills) && job.skills.length > 0 ? job.skills : job.job_domain ? [job.job_domain] : [],
-    location: job.location || "Not specified",
-    applicationUrl: job.application_url || job.applicationUrl || null,
-    matchPercentage: 100,
-  }));
-
-  if (!isAuthenticated) return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
-
-  const userRole = user?.role || "student";
-  const allowedModes = {
-    student: ["student", "resume", "pr_outreach", "alumni_connect"],
-    tpo: ["tpo", "pr_outreach"],
-    admin: ["tpo", "pr_outreach"],
-    company: ["company"],
-    alumni: ["alumni"],
-  };
-  const isUnauthorizedMode = !(allowedModes[userRole] || ["student"]).includes(activeMode);
-
-  const renderActiveMode = () => {
-    if (!isModeChosen) return <WelcomeModeSelect user={user} onModeSelected={handleModeSelect} />;
-
-    if (isUnauthorizedMode) {
-      return (
-        <AccessDeniedView
-          user={user}
-          attemptedMode={activeMode}
-          onReturnToApprovedMode={() => handleModeSwitch((allowedModes[userRole] || ["student"])[0])}
-        />
-      );
-    }
-
-    if (activeMode === "company") {
-      return <CompanyMode user={user} />;
-    }
-    if (activeMode === "tpo") return <AdminMode />;
-    if (activeMode === "resume") {
-      return (
-        <ResumeStudio
-          user={user}
-          scoreData={resumeScoreData}
-          onResumeUploaded={fetchStudentDashboardData}
-          onRunGenerator={() => dispatch(runAIFeature("resume-generator"))}
-          activeTool={activeResumeTool}
-          onToolChange={(tool) => dispatch(setActiveResumeTool(tool))}
-        />
-      );
-    }
-    if (activeMode === "pr_outreach") return <PROutreach />;
-    if (activeMode === "alumni_connect" || activeMode === "alumni") {
-      return <AlumniConnect user={user} alumniMode={activeMode === "alumni"} />;
-    }
-
-    return (
-      <StudentMode
-        user={user}
-        activeFeature={activeFeature}
-        activeJobsTab={activeJobsTab}
-        onFeatureChange={setActiveTab}
-        onJobsTabChange={(tab) => {
-          if (tab === "matched" && aiMatchedJobs.length === 0) {
-            dispatch(runAIFeature("drives"));
-            return;
-          }
-          dispatch(setActiveJobsTab(tab));
-        }}
-        aiMatchedJobs={aiMatchedJobs}
-        databaseJobs={databaseJobs}
-        loading={loadingDrives}
-        onRefresh={fetchStudentDashboardData}
-        onOpenProfile={() => setShowProfileModal(true)}
-        onOpenAlumni={() => handleModeSwitch("alumni_connect")}
-        onOpenInterview={handleOpenInterview}
-      />
-    );
-  };
+  const fullHeight = activeMode === "resume" && isFullHeightResumeTool(activeResumeTool);
+  const forcedPasswordChange = Boolean(user?.mustChangePassword);
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-[#f8fafc] font-sans text-black">
-      <HeaderBar
-        activeMode={activeMode}
-        setActiveMode={handleModeSwitch}
-        user={user}
-        onOpenDrawer={() => setIsDrawerOpen(true)}
-      />
+    <div className="flex h-dvh flex-col overflow-hidden bg-[#f8fafc] text-black">
+      <HeaderBar activeMode={activeMode} setActiveMode={switchMode} user={user} onOpenDrawer={() => setDrawerOpen(true)} />
 
-      <main className="mx-auto h-[calc(100vh-65px)] w-full max-w-7xl flex-1 overflow-hidden px-4 py-4">
-        <div className="grid h-full grid-cols-1 items-stretch gap-6 overflow-hidden lg:grid-cols-12">
-          <div className="flex h-full flex-col overflow-hidden lg:col-span-4"><Chat /></div>
-          <div className={`h-full pr-1 lg:col-span-8 ${activeMode === "resume" && activeResumeTool === "generator" ? "overflow-hidden" : "space-y-6 overflow-y-auto"}`}>
-            <Suspense fallback={<LazyFallback />}>{renderActiveMode()}</Suspense>
-          </div>
+      {offline && (
+        <div role="status" className="flex shrink-0 items-center justify-center gap-2 border-b-2 border-black bg-yellow-100 px-3 py-1.5 text-[11px] font-bold">
+          <WifiOff className="h-3.5 w-3.5" aria-hidden="true" /> The server can&apos;t be reached — showing your saved data.
+        </div>
+      )}
+
+      <main className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col px-3 py-3 sm:px-4 sm:py-4">
+        <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-12 lg:gap-6">
+          <section aria-label="Copilot chat" className={`${pane === "chat" ? "flex" : "hidden"} min-h-0 flex-col lg:col-span-4 lg:flex`}>
+            <Chat />
+          </section>
+          <section
+            aria-label="Workspace"
+            className={`${pane === "workspace" ? "block" : "hidden"} min-h-0 lg:col-span-8 lg:block ${fullHeight ? "overflow-hidden" : "overflow-y-auto overscroll-contain pr-1"}`}
+          >
+            <ErrorBoundary resetKey={activePanel}>
+              <Suspense fallback={<LoadingState label="LOADING WORKSPACE…" />}>
+                <WorkspaceView />
+              </Suspense>
+            </ErrorBoundary>
+          </section>
         </div>
       </main>
 
+      <MobilePaneSwitcher />
+      <OverlayHost onChangePassword={() => setPasswordOpen(true)} />
       <SidebarDrawer
-        isOpen={isDrawerOpen}
-        onClose={() => setIsDrawerOpen(false)}
+        isOpen={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
         user={user}
-        onLogout={handleLogout}
-        onOpenProfile={() => setShowProfileModal(true)}
+        onLogout={() => dispatch(logout())}
         chatSessions={chatSessions}
         onSelectChat={(sessionId) => dispatch(openAIConversation(sessionId))}
+        onNewChat={() => dispatch(startNewAIChat(user?.name))}
+        onOpenPanel={openPanel}
+        onChangePassword={() => setPasswordOpen(true)}
       />
-
-      {showProfileModal && user && (
-        <ProfileModal
+      <NotificationsBridge />
+      {(forcedPasswordChange || passwordOpen) && (
+        <ChangePasswordModal
           user={user}
-          onClose={() => setShowProfileModal(false)}
-          onProfileUpdated={(updatedUser) => {
-            dispatch(setUserContext(updatedUser));
-            localStorage.setItem("user", JSON.stringify(updatedUser));
-            fetchStudentDashboardData();
+          forced={forcedPasswordChange}
+          onClose={() => setPasswordOpen(false)}
+          onSignOut={() => dispatch(logout())}
+          onChanged={(updated) => {
+            setPasswordOpen(false);
+            if (updated) dispatch(userUpdated(updated));
+            else dispatch(refreshCurrentUser()).catch(() => {});
           }}
         />
       )}
     </div>
+  );
+}
+
+/** "/" — session gate (FRONTEND.md §5). */
+function AppShell() {
+  const status = useSelector((state) => state.session.status);
+  const endedReason = useSelector((state) => state.session.endedReason);
+
+  if (status === "checking") return <FullPageLoader label="CHECKING YOUR SESSION…" />;
+  if (status !== "authenticated") {
+    return <AuthScreen notice={endedReason === "expired" ? "Your session expired. Please sign in again." : undefined} />;
+  }
+  return <AuthenticatedShell />;
+}
+
+/** Standalone pages owned by other roles, loaded through the feature registry. */
+function RoutePage({ children }) {
+  return <div className="min-h-dvh bg-[#f8fafc] text-black">{children}</div>;
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<AppShell />} />
+      <Route
+        path="/attend"
+        element={
+          <RequireAuth
+            roles={["student"]}
+            title="SIGN IN TO MARK ATTENDANCE"
+            subtitle="Stay signed in on this phone so the next scan takes one second."
+          >
+            <RoutePage>
+              <FeatureSlot name="AttendPage" resetKey="route:attend" standalone fallbackLabel="OPENING ATTENDANCE…" />
+            </RoutePage>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/present/:sessionId"
+        element={
+          <RequireAuth roles={["teacher", "tpo", "admin"]} title="SIGN IN TO PRESENT ATTENDANCE" subtitle="Use your faculty account to show the live QR code.">
+            <RoutePage>
+              <FeatureSlot name="PresenterPage" resetKey="route:present" standalone fallbackLabel="OPENING PRESENTER…" />
+            </RoutePage>
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/reset-password/:token"
+        element={
+          <Suspense fallback={<FullPageLoader />}>
+            <ResetPasswordPage />
+          </Suspense>
+        }
+      />
+      <Route
+        path="/report-issue"
+        element={
+          <Suspense fallback={<FullPageLoader />}>
+            <ReportIssuePage />
+          </Suspense>
+        }
+      />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 }

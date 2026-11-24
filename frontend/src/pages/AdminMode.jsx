@@ -1,108 +1,34 @@
-import { useEffect, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { ArrowLeft, ArrowRight, BarChart3, Briefcase, CalendarDays, CheckCircle2, ClipboardCheck, FilePlus2, GraduationCap, Handshake, LoaderCircle, Newspaper, Send, Settings, Sparkles, TrendingUp, UserRoundCheck } from "lucide-react";
-import { api } from "../lib/api";
-import { runAIFeature, sendAIMessage } from "../services/aiRequestHandler";
-import { selectAILoading, selectJobCreationWorkspace } from "../store/aiChatSlice";
-import { setActiveFeature } from "../store/appContextSlice";
-import PlacementCalendar from "../components/PlacementCalendar";
-import TrainingScheduler from "../components/TrainingScheduler";
-import OfferManagement from "../components/OfferManagement";
-import PolicyConfigPanel from "../components/PolicyConfigPanel";
-import GapAnalysisPanel from "../components/GapAnalysisPanel";
-
-const TPO_TOOLS = [
-  {
-    id: "job-creator",
-    title: "Job Creator",
-    description: "Create, validate and publish placement jobs through the AI assistant.",
-    badge: "AVAILABLE",
-    badgeClass: "bg-green-200",
-    icon: FilePlus2,
-    action: "job-creation",
-  },
-  {
-    id: "gap-analysis",
-    title: "Gap Analysis",
-    description: "Analyse curriculum-to-industry skill gaps and get AI-powered elective recommendations.",
-    badge: "AVAILABLE",
-    badgeClass: "bg-green-200",
-    icon: TrendingUp,
-    action: "gap-analysis",
-  },
-  {
-    id: "job-postings",
-    title: "Job Postings",
-    description: "View every placement job published for students at your college.",
-    badge: "LIVE",
-    badgeClass: "bg-blue-100",
-    icon: Newspaper,
-    action: "job-postings",
-  },
-  {
-    id: "placement-calendar",
-    title: "Placement Calendar",
-    description: "View placement drives and application deadlines in one calendar.",
-    badge: "LIVE",
-    badgeClass: "bg-blue-100",
-    icon: CalendarDays,
-    action: "placement-calendar",
-  },
-  {
-    id: "training-scheduler",
-    title: "Training Scheduler",
-    description: "Create and manage student training programs and schedules.",
-    badge: "LIVE",
-    badgeClass: "bg-green-100",
-    icon: GraduationCap,
-    action: "training-scheduler",
-  },
-  {
-    id: "offer-management",
-    title: "Offer Management",
-    description: "Track offer lifecycles, placements and TPO overrides.",
-    badge: "LIVE",
-    badgeClass: "bg-yellow-100",
-    icon: Handshake,
-    action: "offer-management",
-  },
-  {
-    id: "policy-configuration",
-    title: "Placement Policy",
-    description: "Configure institutional offer and placement rules.",
-    badge: "LIVE",
-    badgeClass: "bg-gray-100",
-    icon: Settings,
-    action: "policy-configuration",
-  },
-  {
-    id: "eligibility-rules",
-    title: "Eligibility Rules",
-    description: "Define branch, CGPA, backlog and graduation-year eligibility policies.",
-    badge: "COMING SOON",
-    icon: ClipboardCheck,
-    badgeClass: "bg-gray-100",
-    action: "eligibility-rules",
-  },
-  {
-    id: "application-review",
-    title: "Application Review",
-    description: "Review applicants, eligibility decisions and placement progress.",
-    badge: "COMING SOON",
-    icon: UserRoundCheck,
-    badgeClass: "bg-gray-100",
-    action: "application-review",
-  },
-  {
-    id: "placement-analytics",
-    title: "Placement Analytics",
-    description: "Track job performance, applications, selections and placement outcomes.",
-    badge: "COMING SOON",
-    icon: BarChart3,
-    badgeClass: "bg-gray-100",
-    action: "placement-analytics",
-  },
-];
+import {
+  BarChart3,
+  Briefcase,
+  Building2,
+  CalendarCheck,
+  CalendarDays,
+  CheckCircle2,
+  FilePlus2,
+  Flag,
+  GraduationCap,
+  Handshake,
+  LoaderCircle,
+  Plus,
+  Presentation,
+  Rss,
+  Send,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  TrendingUp,
+  UserRoundCheck,
+} from "lucide-react";
+import { runAIFeature, sendAIMessage, startNewAIChat } from "../services/aiRequestHandler.js";
+import { selectAILoading, selectJobCreationWorkspace } from "../store/aiChatSlice.js";
+import EmptyState from "../ui/EmptyState.jsx";
+import BackBar from "../workspace/BackBar.jsx";
+import FeatureSlot from "../workspace/FeatureSlot.jsx";
+import ToolTile from "../workspace/ToolTile.jsx";
+import { panelTitle } from "../workspace/panels.js";
+import { openPanel } from "../workspace/uiActions.js";
 
 const JOB_FIELD_LABELS = {
   company_name: "Company",
@@ -126,51 +52,71 @@ const formatJobValue = (value) => {
   return String(value);
 };
 
-function JobCreatorPanel() {
+/** Inline AI job creator (tpo.job-creator): the chat fills the draft, these buttons confirm/post. */
+function JobCreatorPanel({ user }) {
   const dispatch = useDispatch();
   const workspace = useSelector(selectJobCreationWorkspace);
   const aiLoading = useSelector(selectAILoading);
   const job = workspace.job || {};
   const hasDraft = Boolean(workspace.job);
 
-  const sendJobAction = (text) => dispatch(sendAIMessage({
-    text,
-    modeName: "job-creation",
-    source: "job-creator-ui",
-    feature: "job-creation",
-  }));
+  const sendJobAction = (text) =>
+    dispatch(sendAIMessage({ text, modeName: "job-creation", source: "job-creator-ui", feature: "job-creation" }));
+
+  // A new chat session = a new draft (the backend keys drafts by session), so job 2 never overwrites job 1.
+  const startNewJob = () => {
+    dispatch(startNewAIChat(user?.name));
+    dispatch(runAIFeature("job-creation"));
+  };
 
   return (
-    <div className="card-stark bg-white">
+    <section className="card-stark bg-white">
       <div className="mb-4 flex flex-col justify-between gap-3 border-b-2 border-black pb-3 sm:flex-row sm:items-center">
         <div className="flex items-center gap-2">
-          <div className="bg-black p-2 text-white"><Sparkles className="h-5 w-5" /></div>
+          <div className="bg-black p-2 text-white">
+            <Sparkles className="h-5 w-5" aria-hidden="true" />
+          </div>
           <div>
-            <h3 className="text-sm font-black uppercase">AI Job Creator</h3>
+            <h3 className="text-sm font-black uppercase">AI job creator</h3>
             <p className="text-[11px] font-semibold text-gray-600">Build, validate and post a placement job through chat.</p>
           </div>
         </div>
-        <span className={`badge-stark text-[10px] ${workspace.status === "post" ? "bg-green-200" : workspace.status === "error" ? "bg-red-100" : "bg-yellow-100"}`}>
-          {workspace.status.replaceAll("_", " ").toUpperCase()}
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`badge-stark text-[10px] ${workspace.status === "post" ? "bg-green-200" : workspace.status === "error" ? "bg-red-100" : "bg-yellow-100"}`}>
+            {String(workspace.status || "idle").replaceAll("_", " ").toUpperCase()}
+          </span>
+          {hasDraft && (
+            <button type="button" disabled={aiLoading} onClick={startNewJob} className="btn-secondary px-2.5 py-1 text-[10px] disabled:opacity-50">
+              <Plus className="h-3.5 w-3.5" aria-hidden="true" /> NEW JOB
+            </button>
+          )}
+        </div>
       </div>
 
-      {!hasDraft ? (
-        <div className="flex flex-col items-center justify-center border-2 border-dashed border-gray-400 bg-gray-50 p-7 text-center">
-          <Briefcase className="mb-2 h-8 w-8" />
-          <h4 className="text-xs font-black uppercase">Create a placement job</h4>
-          <p className="mt-1 max-w-md text-[11px] text-gray-600">The assistant will collect the company, role, description, deadline and eligibility details.</p>
-          <button type="button" disabled={aiLoading} onClick={() => dispatch(runAIFeature("job-creation"))} className="btn-primary mt-4 px-3 py-1.5 text-xs disabled:opacity-50">
-            {aiLoading ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} START JOB CREATOR
-          </button>
+      {workspace.status === "error" && workspace.error && (
+        <div role="alert" className="mb-3 border-2 border-black bg-red-100 p-3 text-xs font-bold">
+          {workspace.error}
         </div>
+      )}
+
+      {!hasDraft ? (
+        <EmptyState
+          icon={Briefcase}
+          title="Create a placement job"
+          text="The assistant collects the company, role, description, deadline and eligibility details."
+          action={
+            <button type="button" disabled={aiLoading} onClick={() => dispatch(runAIFeature("job-creation"))} className="btn-primary min-h-11 px-3 py-1.5 text-xs disabled:opacity-50 sm:min-h-0">
+              {aiLoading ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Sparkles className="h-4 w-4" aria-hidden="true" />} START JOB CREATOR
+            </button>
+          }
+        />
       ) : (
         <>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {Object.entries(JOB_FIELD_LABELS).map(([field, label]) => (
               <div key={field} className={`${field === "job_description" ? "sm:col-span-2" : ""} border-2 border-black bg-gray-50 p-2.5`}>
                 <div className="text-[9px] font-black uppercase text-gray-500">{label}</div>
-                <div className="mt-0.5 break-words text-[11px] font-bold">{formatJobValue(job[field])}</div>
+                <div className="mt-0.5 whitespace-pre-wrap break-words text-[11px] font-bold">{formatJobValue(job[field])}</div>
               </div>
             ))}
           </div>
@@ -179,9 +125,13 @@ function JobCreatorPanel() {
             <div className="mt-3 border-2 border-black bg-yellow-100 p-3">
               <div className="text-[10px] font-black uppercase">Still required</div>
               <div className="mt-2 flex flex-wrap gap-1.5">
-                {workspace.missingFields.map((field) => <span key={field} className="badge-stark bg-white text-[9px]">{JOB_FIELD_LABELS[field] || field}</span>)}
+                {workspace.missingFields.map((field) => (
+                  <span key={field} className="badge-stark bg-white text-[9px]">
+                    {JOB_FIELD_LABELS[field] || field}
+                  </span>
+                ))}
               </div>
-              <p className="mt-2 text-[10px] font-semibold">Provide these details in the chat on the left.</p>
+              <p className="mt-2 text-[10px] font-semibold">Provide these details in the chat.</p>
             </div>
           )}
 
@@ -190,170 +140,122 @@ function JobCreatorPanel() {
               {workspace.status === "post" ? `Saved job ID: ${workspace.persistedJobId || "created"}` : "Every change made in chat updates this draft."}
             </div>
             {workspace.status === "ready" && !workspace.awaitingConfirmation && (
-              <button type="button" disabled={aiLoading} onClick={() => sendJobAction("Post the job")} className="btn-primary px-3 py-1.5 text-xs disabled:opacity-50">
-                <Send className="h-4 w-4" /> REVIEW FOR POSTING
+              <button type="button" disabled={aiLoading} onClick={() => sendJobAction("Post the job")} className="btn-primary min-h-11 px-3 py-1.5 text-xs disabled:opacity-50 sm:min-h-0">
+                <Send className="h-4 w-4" aria-hidden="true" /> REVIEW FOR POSTING
               </button>
             )}
             {workspace.awaitingConfirmation && (
-              <button type="button" disabled={aiLoading} onClick={() => sendJobAction("Yes, confirm and post the job")} className="btn-primary bg-green-200 px-3 py-1.5 text-xs text-black disabled:opacity-50">
-                <CheckCircle2 className="h-4 w-4" /> CONFIRM & POST
+              <button
+                type="button"
+                disabled={aiLoading}
+                onClick={() => sendJobAction("Yes, confirm and post the job")}
+                className="btn-primary min-h-11 bg-green-200 px-3 py-1.5 text-xs text-black hover:bg-green-300 disabled:opacity-50 sm:min-h-0"
+              >
+                <CheckCircle2 className="h-4 w-4" aria-hidden="true" /> CONFIRM & POST
               </button>
             )}
           </div>
         </>
       )}
-    </div>
+    </section>
   );
 }
 
-function JobPostingsPanel({ drives, loading }) {
-  return (
-    <div className="card-stark bg-white">
-      <div className="mb-4 flex items-center justify-between border-b-2 border-black pb-2">
-        <h3 className="text-sm font-black uppercase">JOB POSTINGS</h3>
-        <span className="badge-stark">{drives.length} TOTAL</span>
-      </div>
+// activeFeature → feature component (tpo / attendance-teacher roles) + props.
+const FEATURE_SLOTS = {
+  "gap-analysis": { name: "GapAnalysisPanel" },
+  "job-postings": { name: "DrivesPanel", props: { scope: "tpo" } },
+  "application-review": { name: "ApplicantsPanel", props: { scope: "tpo" } },
+  "offer-management": { name: "OfferManagement" },
+  "policy-configuration": { name: "PolicyConfigPanel" },
+  "placement-analytics": { name: "PlacementAnalyticsPanel" },
+  "training-scheduler": { name: "TrainingScheduler" },
+  "placement-calendar": { name: "TpoCalendarPanel" },
+  "job-feed": { name: "JobFeedAdminPanel" },
+  faculty: { name: "FacultyPanel" },
+  recruiters: { name: "RecruitersPanel" },
+  "attendance-oversight": { name: "AttendanceOversightPanel" },
+  "issue-reports": { name: "IssueReportsPanel" },
+};
 
-      {loading ? (
-        <div className="p-4 text-xs font-bold">Loading job postings...</div>
-      ) : drives.length === 0 ? (
-        <div className="border-2 border-dashed border-gray-400 bg-gray-50 p-7 text-center">
-          <Briefcase className="mx-auto mb-2 h-7 w-7 text-gray-400" />
-          <p className="text-xs font-black uppercase">No jobs posted yet</p>
-          <p className="mt-1 text-[10px] text-gray-500">Create the first posting with Job Creator.</p>
-        </div>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse border-2 border-black text-left">
-            <thead>
-              <tr className="bg-black text-xs uppercase text-white">
-                <th className="border-2 border-black p-2">Company</th>
-                <th className="border-2 border-black p-2">Role Title</th>
-                <th className="border-2 border-black p-2">Min CGPA</th>
-                <th className="border-2 border-black p-2">Branches</th>
-                <th className="border-2 border-black p-2">Package</th>
-                <th className="border-2 border-black p-2">Status</th>
-              </tr>
-            </thead>
-            <tbody className="text-xs font-medium">
-              {drives.map((drive) => (
-                <tr key={drive._id || drive.companyName} className="hover:bg-gray-50">
-                  <td className="border-2 border-black p-2 font-extrabold">{drive.companyName}</td>
-                  <td className="border-2 border-black p-2 font-bold">{drive.roleTitle}</td>
-                  <td className="border-2 border-black p-2 font-mono">{drive.minCgpa}</td>
-                  <td className="border-2 border-black p-2">{drive.eligibleBranch.length ? drive.eligibleBranch.join(", ") : "All branches"}</td>
-                  <td className="border-2 border-black p-2 font-bold">{drive.packageLpa}</td>
-                  <td className="border-2 border-black p-2"><span className="badge-stark bg-green-200 text-[10px]">{drive.status.toUpperCase()}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-}
-
-const normalizeDrive = (job) => ({
-  ...job,
-  companyName: job.company?.name || job.companyName || "Unknown Company",
-  roleTitle: job.title || job.roleTitle || "Available Role",
-  minCgpa: job.minimumCgpa ?? job.minCgpa ?? "Not specified",
-  eligibleBranch: job.eligibleBranches || job.eligibleBranch || [],
-  packageLpa: job.salary || job.packageLpa || "Not disclosed",
-  status: job.status || "active",
-  deadline: job.applicationDeadline || job.deadline,
-});
-
-export default function AdminMode() {
+function TpoHome() {
   const dispatch = useDispatch();
-  const [drives, setDrives] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const persistedJobId = useSelector((state) => state.aiChat.jobCreationWorkspace.persistedJobId);
-  const activeFeature = useSelector((state) => state.appContext.activeFeature);
+  const hasDraft = useSelector((state) => Boolean(state.aiChat.jobCreationWorkspace.job));
+  const gapStatus = useSelector((state) => state.aiChat.gapAnalysisWorkspace.status);
 
-  useEffect(() => {
-    const fetchDrives = async () => {
-      try {
-        const result = await api.getJobs();
-        const jobs = result.data || result.jobs || [];
-        setDrives(jobs.map(normalizeDrive));
-      } catch (e) {
-        console.error(e);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchDrives();
-  }, [persistedJobId]);
+  const tiles = [
+    {
+      icon: FilePlus2,
+      title: "AI job creator",
+      description: "Create, validate and publish placement jobs through the AI assistant.",
+      badge: hasDraft ? "DRAFT IN PROGRESS" : "AI ASSISTED",
+      badgeClass: "bg-green-200",
+      onClick: () => (hasDraft ? openPanel("tpo.job-creator") : dispatch(runAIFeature("job-creation"))),
+    },
+    {
+      icon: TrendingUp,
+      title: "Gap analysis",
+      description: "Curriculum-to-industry skill gaps with AI elective recommendations.",
+      badge: "AI ASSISTED",
+      badgeClass: "bg-green-200",
+      onClick: () => (gapStatus === "idle" ? dispatch(runAIFeature("gap-analysis")) : openPanel("tpo.gap-analysis")),
+    },
+    { icon: Briefcase, title: "Placement drives", description: "Create, edit, approve and close campus drives.", badge: "DRIVES", badgeClass: "bg-blue-100", panel: "tpo.drives" },
+    { icon: UserRoundCheck, title: "Applicants", description: "Review applicants and move them through hiring stages.", badge: "PIPELINE", badgeClass: "bg-blue-100", panel: "tpo.applicants" },
+    { icon: Handshake, title: "Offer management", description: "Track offer lifecycles, placements and TPO overrides.", badge: "OFFERS", badgeClass: "bg-yellow-100", panel: "tpo.offers" },
+    { icon: Settings, title: "Placement policy", description: "One-offer rule, dream upgrades and offer expiry.", badge: "RULES", badgeClass: "bg-gray-100", panel: "tpo.policy" },
+    { icon: BarChart3, title: "Placement analytics", description: "Placed %, offers, CTC and branch-wise outcomes.", badge: "STATS", badgeClass: "bg-purple-100", panel: "tpo.analytics" },
+    { icon: GraduationCap, title: "Training scheduler", description: "Create training programs, schedules and rosters.", badge: "PROGRAMS", badgeClass: "bg-green-100", panel: "tpo.training" },
+    { icon: CalendarDays, title: "Drive calendar", description: "Drive dates and application deadlines by day.", badge: "CALENDAR", badgeClass: "bg-yellow-100", panel: "tpo.calendar" },
+    { icon: Rss, title: "Job feed", description: "Open-market job sync status, sources and the live feed.", badge: "MARKET", badgeClass: "bg-blue-100", panel: "tpo.job-feed" },
+    { icon: Presentation, title: "Faculty", description: "Invite teachers and manage faculty accounts.", badge: "ACCOUNTS", badgeClass: "bg-gray-100", panel: "tpo.faculty" },
+    { icon: Building2, title: "Recruiters", description: "Invite recruiters and manage company accounts.", badge: "ACCOUNTS", badgeClass: "bg-gray-100", panel: "tpo.recruiters" },
+    { icon: CalendarCheck, title: "Attendance oversight", description: "Course and session attendance across departments.", badge: "READ-ONLY", badgeClass: "bg-blue-100", panel: "tpo.attendance" },
+    { icon: Flag, title: "Issue reports", description: "Problems reported by students, faculty and visitors.", badge: "INBOX", badgeClass: "bg-red-100", panel: "tpo.issues" },
+  ];
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {tiles.map(({ panel, onClick, title, ...tile }) => (
+        <ToolTile key={title} {...tile} title={title.toUpperCase()} onClick={onClick ?? (() => openPanel(panel))} />
+      ))}
+    </div>
+  );
+}
+
+/** College TPO workspace (FRONTEND.md §12.2) — also the admin workspace. */
+export default function AdminMode({ user }) {
+  const activeFeature = useSelector((state) => state.appContext.activeFeature);
+  const activePanel = useSelector((state) => state.appContext.activePanel);
+  const slot = FEATURE_SLOTS[activeFeature];
+
+  return (
+    <div className="mx-auto max-w-6xl space-y-6">
       <div className="card-stark bg-white">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Briefcase className="w-6 h-6 text-black" />
+            <ShieldCheck className="h-6 w-6" aria-hidden="true" />
             <div>
-              <h2 className="font-black text-lg uppercase">COLLEGE TPO MODE</h2>
-              <p className="text-xs font-semibold text-gray-600">
-                Create jobs and manage institutional placement operations.
-              </p>
+              <h2 className="text-lg font-black uppercase">College TPO mode</h2>
+              <p className="text-xs font-semibold text-gray-600">{user?.collegeName || "Drives, applicants, offers, policy, analytics and faculty."}</p>
             </div>
           </div>
-          <span className="badge-stark bg-black text-white text-xs">TPO OPERATIONS</span>
+          <span className="badge-stark bg-black text-xs text-white">{user?.role === "admin" ? "ADMIN" : "PLACEMENT CELL"}</span>
         </div>
       </div>
 
-      {activeFeature !== null ? (
-        <div className="space-y-4">
-          <button type="button" onClick={() => dispatch(setActiveFeature(null))} className="btn-secondary px-3 py-1.5 text-xs">
-            <ArrowLeft className="h-4 w-4" /> BACK TO TPO TOOLS
-          </button>
-          {activeFeature === "job-creator" && <JobCreatorPanel />}
-          {activeFeature === "gap-analysis" && <GapAnalysisPanel />}
-          {activeFeature === "job-postings" && <JobPostingsPanel drives={drives} loading={loading} />}
-          {activeFeature === "placement-calendar" && <PlacementCalendar drives={drives} title="TPO PLACEMENT DRIVE CALENDAR" />}
-          {activeFeature === "training-scheduler" && <TrainingScheduler />}
-          {activeFeature === "offer-management" && <OfferManagement />}
-          {activeFeature === "policy-configuration" && <PolicyConfigPanel />}
-          {!["job-creator", "gap-analysis", "job-postings", "placement-calendar", "training-scheduler", "offer-management", "policy-configuration"].includes(activeFeature) && (
-            <div className="card-stark flex min-h-64 flex-col items-center justify-center bg-white p-8 text-center">
-              <Sparkles className="mb-3 h-8 w-8" />
-              <h3 className="text-sm font-black uppercase">{TPO_TOOLS.find((tool) => tool.id === activeFeature)?.title || "TPO TOOL"}</h3>
-              <p className="mt-1 text-xs font-semibold text-gray-600">This tool is coming soon.</p>
-            </div>
-          )}
-        </div>
+      {activeFeature === null || activeFeature === undefined ? (
+        <TpoHome />
       ) : (
-        <div className="space-y-6">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {TPO_TOOLS.map((tool) => {
-              const Icon = tool.icon;
-              return (
-                <button
-                  key={tool.id}
-                  type="button"
-                  onClick={() => tool.action === "job-creation" ? dispatch(runAIFeature("job-creation")) : tool.action === "gap-analysis" ? dispatch(runAIFeature("gap-analysis")) : dispatch(setActiveFeature(tool.action))}
-                  className="card-stark group flex min-h-48 cursor-pointer flex-col items-center justify-between bg-white p-4 text-center transition-all hover:-translate-y-0.5 hover:bg-gray-50"
-                >
-                  <div className="mb-2 bg-black p-3.5 text-white">
-                    <Icon className="h-8 w-8" />
-                  </div>
-                  <div className="my-auto space-y-1">
-                    <h3 className="text-sm font-black uppercase tracking-tight group-hover:underline">{tool.title}</h3>
-                    <p className="line-clamp-2 text-[11px] font-medium text-gray-600">{tool.description}</p>
-                  </div>
-                  <div className="mt-auto flex w-full items-center justify-between border-t-1.5 border-black pt-2">
-                    <span className={`badge-stark text-[10px] ${tool.badgeClass}`}>{tool.badge}</span>
-                    <div className="btn-primary px-2 py-1 text-[10px]">
-                      <span>OPEN</span>
-                      <ArrowRight className="h-3 w-3" />
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
+        <div className="space-y-4">
+          <BackBar label="TPO HOME" title={panelTitle(activePanel)} onBack={() => openPanel("tpo.home")} />
+          {activeFeature === "job-creator" ? (
+            <JobCreatorPanel user={user} />
+          ) : slot ? (
+            <FeatureSlot name={slot.name} resetKey={activeFeature} {...(slot.props || {})} />
+          ) : (
+            <EmptyState title="This tool isn't available" text="Go back to TPO home and pick another tool." />
+          )}
         </div>
       )}
     </div>

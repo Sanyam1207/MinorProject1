@@ -1,378 +1,308 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense } from "react";
+import { useDispatch, useSelector } from "react-redux";
 import {
-  ArrowLeft,
-  ArrowRight,
   Award,
+  BookOpen,
   BriefcaseBusiness,
-  Building,
+  Building2,
+  CalendarCheck,
+  CalendarClock,
   CalendarDays,
   ClipboardList,
+  ExternalLink,
   FolderKanban,
-  RefreshCw,
+  Globe,
+  GraduationCap,
+  Mic2,
+  Package,
+  ScanQrCode,
   Sliders,
   Sparkles,
   User,
-  BookOpen,
-  Package,
   Users,
-  Mic2,
-  GraduationCap,
 } from "lucide-react";
+import { runAIFeature } from "../services/aiRequestHandler.js";
+import EmptyState from "../ui/EmptyState.jsx";
+import ErrorBoundary from "../ui/ErrorBoundary.jsx";
+import LoadingState from "../ui/LoadingState.jsx";
+import Tabs from "../ui/Tabs.jsx";
+import { formatDate, formatTime } from "../ui/format.js";
+import { STATUS_COLORS } from "../ui/statusColors.js";
+import BackBar from "../workspace/BackBar.jsx";
+import FeatureSlot from "../workspace/FeatureSlot.jsx";
+import ToolTile from "../workspace/ToolTile.jsx";
+import { useAttendanceSummary, useOpportunitySummary } from "../workspace/featureModules.js";
+import { panelTitle } from "../workspace/panels.js";
+import { openPanel } from "../workspace/uiActions.js";
+import { usePanel } from "../workspace/usePanel.js";
 
-const DriveGrid = lazy(() => import("../components/DriveGrid"));
-const PlacementCalendar = lazy(() => import("../components/PlacementCalendar"));
-const TrainingHub = lazy(() => import("../components/TrainingHub"));
-const StudentOffers = lazy(() => import("../components/StudentOffers"));
-const InterviewWorkspace = lazy(() => import("../components/InterviewWorkspace"));
-const LearningRecommendationWorkspace = lazy(() => import("../components/LearningRecommendationWorkspace"));
+const InterviewWorkspace = lazy(() => import("../components/InterviewWorkspace.jsx"));
+const LearningRecommendationWorkspace = lazy(() => import("../components/LearningRecommendationWorkspace.jsx"));
 
-const LazyFallback = () => (
-  <div className="card-stark my-auto flex flex-col items-center justify-center gap-3 border-1.5 border-black bg-white p-10 text-center">
-    <Sparkles className="h-8 w-8 animate-spin text-black" />
-    <div className="text-xs font-black uppercase tracking-wider text-black">
-      LAZY LOADING STUDENT MODULE...
-    </div>
-  </div>
-);
+const NOT_SET = "Not set";
+const hasValue = (value) => value !== null && value !== undefined && value !== "";
 
-function FeatureCard({ icon: Icon, title, description, badge, badgeClass, onClick }) {
+// activeFeature → feature component owned by another role (FeatureSlot registry).
+const FEATURE_SLOTS = {
+  drives: "JobsHub",
+  applications: "ApplicationsPanel",
+  offers: "StudentOffers",
+  training: "TrainingHub",
+  calendar: "CalendarPanel",
+  attendance: "StudentAttendancePanel",
+  "attendance-scan": "ScanPanel",
+  schedule: "StudentSchedulePanel",
+};
+
+function StudentHome() {
+  const dispatch = useDispatch();
+  const interviewStatus = useSelector((state) => state.aiChat.interviewWorkspace.status);
+  const attendance = useAttendanceSummary();
+  const opportunities = useOpportunitySummary();
+  const count = (value, label) => (opportunities.loading ? "…" : `${Number(value) || 0} ${label}`);
+
+  const attendanceBadge =
+    attendance.loading
+      ? "…"
+      : attendance.overallPercent === null || attendance.overallPercent === undefined
+        ? "NO CLASSES YET"
+        : `${Math.round(attendance.overallPercent)}%`;
+  const nextClassBadge = attendance.loading
+    ? "…"
+    : attendance.nextClass?.startsAt
+      ? `NEXT ${formatDate(attendance.nextClass.startsAt, { weekday: "short" })} ${formatTime(attendance.nextClass.startsAt)}`.toUpperCase()
+      : "NO UPCOMING CLASS";
+
+  const tiles = [
+    { icon: ScanQrCode, title: "Scan attendance QR", description: "Scan the QR your teacher shows to mark yourself present.", badge: "MARK PRESENT", badgeClass: "bg-yellow-200", onClick: () => openPanel("attendance.scan") },
+    { icon: CalendarCheck, title: "My attendance", description: "Course-wise attendance, history and how many classes you can miss.", badge: attendanceBadge, badgeClass: STATUS_COLORS.standing[attendance.status] ?? "bg-gray-100", onClick: () => openPanel("attendance.student") },
+    { icon: CalendarClock, title: "Class schedule", description: "Upcoming classes, live sessions and cancellations.", badge: nextClassBadge, badgeClass: "bg-blue-100", onClick: () => openPanel("schedule") },
+    { icon: Building2, title: "Campus drives", description: "Placement drives at your college with eligibility checks.", badge: count(opportunities.campusCount, "OPEN"), badgeClass: "bg-green-100", onClick: () => openPanel("jobs.campus") },
+    { icon: Sparkles, title: "AI job matches", description: "Jobs matched to your profile by the AI job finder.", badge: count(opportunities.aiMatches, "MATCHES"), badgeClass: "bg-purple-100", onClick: () => openPanel("jobs.matched") },
+    { icon: Globe, title: "Open market jobs", description: "Live internships and jobs aggregated from across the web.", badge: "LIVE FEED", badgeClass: "bg-blue-100", onClick: () => openPanel("jobs.market") },
+    { icon: ClipboardList, title: "My applications", description: "Track every application and its hiring stage.", badge: count(opportunities.applicationsActive, "ACTIVE"), badgeClass: "bg-green-100", onClick: () => openPanel("applications") },
+    { icon: Package, title: "My offers", description: "Accept, reject or upgrade placement offers.", badge: count(opportunities.offersPending, "PENDING"), badgeClass: "bg-yellow-100", onClick: () => openPanel("offers") },
+    { icon: BookOpen, title: "Training", description: "Aptitude, soft-skill and technical training programs.", badge: count(opportunities.trainingUpcoming, "UPCOMING"), badgeClass: "bg-blue-100", onClick: () => openPanel("training") },
+    { icon: CalendarDays, title: "Placement calendar", description: "Drive dates, deadlines and training sessions by day.", badge: "DRIVES & DEADLINES", badgeClass: "bg-yellow-100", onClick: () => openPanel("calendar") },
+    { icon: User, title: "My portfolio", description: "Skills, projects, certifications and experience in one place.", badge: "PROFILE", badgeClass: "bg-purple-100", onClick: () => openPanel("portfolio") },
+    {
+      icon: Mic2,
+      title: "Mock interview",
+      description: "Practise a job-specific or profile-based interview with AI feedback.",
+      badge: "AI INTERVIEWER",
+      badgeClass: "bg-yellow-200",
+      onClick: () => (interviewStatus === "idle" || interviewStatus === "error" ? dispatch(runAIFeature("mock-interview")) : openPanel("interview")),
+    },
+    { icon: GraduationCap, title: "Learning roadmap", description: "Study plans built from your mock interview results.", badge: "AI RECOMMENDER", badgeClass: "bg-purple-100", onClick: () => openPanel("learning") },
+    { icon: Users, title: "Alumni connect", description: "Find alumni mentors and manage your requests.", badge: "MENTORS", badgeClass: "bg-purple-100", onClick: () => openPanel("alumni") },
+  ];
+
   return (
-    <div
-      onClick={onClick}
-      className="card-stark group flex min-h-48 cursor-pointer flex-col items-center justify-between bg-white p-4 text-center transition-all hover:-translate-y-0.5 hover:bg-gray-50"
-    >
-      <div className="mb-2 bg-black p-3.5 text-white">
-        <Icon className="h-8 w-8" />
-      </div>
-      <div className="my-auto space-y-1">
-        <h3 className="text-sm font-black uppercase tracking-tight group-hover:underline">{title}</h3>
-        <p className="line-clamp-2 text-[11px] font-medium text-gray-600">{description}</p>
-      </div>
-      <div className="mt-auto flex w-full items-center justify-between border-t-1.5 border-black pt-2">
-        <span className={`badge-stark text-[10px] ${badgeClass}`}>{badge}</span>
-        <div className="btn-primary px-2 py-1 text-[10px]">
-          <span>OPEN</span>
-          <ArrowRight className="h-3 w-3" />
-        </div>
-      </div>
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {tiles.map((tile) => (
+        <ToolTile key={tile.title} {...tile} title={tile.title.toUpperCase()} />
+      ))}
     </div>
   );
 }
 
-export default function StudentMode({
-  user,
-  activeFeature,
-  activeJobsTab,
-  onFeatureChange,
-  onJobsTabChange,
-  aiMatchedJobs,
-  databaseJobs,
-  loading,
-  onRefresh,
-  onOpenProfile,
-  onOpenAlumni,
-  onOpenInterview,
-}) {
-  const applications = databaseJobs.filter((job) => job.applicationStatus);
-  const featureNames = {
-    drives: "JOBS FOR ME",
-    portfolio: "MY PORTFOLIO",
-    applications: "APPLICATION TRACKING",
-    calendar: "PLACEMENT CALENDAR",
-    training: "TRAINING PROGRAMS",
-    offers: "MY OFFERS",
-    "mock-interview": "AI MOCK INTERVIEW",
-    "learning-recommendation": "AI LEARNING ROADMAP",
-  };
+const PORTFOLIO_TABS = [
+  { id: "profile", label: "Skills & profile" },
+  { id: "projects", label: "Projects" },
+  { id: "experience", label: "Experience" },
+];
+const PROFILE_TAB_FOR = { profile: "Skills", projects: "Projects", experience: "Experience" };
 
-  const [portfolioTab, setPortfolioTab] = useState("profile");
+function Portfolio({ user }) {
+  const { params, setParams } = usePanel("portfolio");
+  const tab = PORTFOLIO_TABS.some((item) => item.id === params.tab) ? params.tab : "profile";
+
+  return (
+    <section className="card-stark space-y-4 bg-white">
+      <div className="flex flex-col items-start justify-between gap-3 border-b-2 border-black pb-3 sm:flex-row sm:items-center">
+        <Tabs tabs={PORTFOLIO_TABS} value={tab} onChange={(next) => setParams({ tab: next })} label="Portfolio sections" className="sm:w-auto" />
+        <button type="button" onClick={() => openPanel("profile", { tab: PROFILE_TAB_FOR[tab] })} className="btn-primary min-h-11 shrink-0 px-3 py-1.5 text-xs sm:min-h-0">
+          <Sliders className="h-3.5 w-3.5" aria-hidden="true" /> EDIT PORTFOLIO
+        </button>
+      </div>
+
+      {tab === "profile" && (
+        <div className="animate-fadeIn space-y-4">
+          <div className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-3">
+            {[
+              ["Full name", user?.name],
+              ["College", user?.collegeName],
+              ["Passing year", user?.passingYear],
+              ["Branch", user?.branch],
+              ["CGPA", hasValue(user?.cgpa) ? user.cgpa : null],
+              ["Roll number", user?.rollNumber],
+            ].map(([label, value]) => (
+              <div key={label} className="border-[1.5px] border-black bg-gray-50 p-3">
+                <div className="text-[10px] font-extrabold uppercase text-gray-500">{label}</div>
+                <div className="break-words text-sm font-black">{hasValue(value) ? value : NOT_SET}</div>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div className="mb-2 flex items-center gap-1 text-xs font-extrabold uppercase">
+              <User className="h-4 w-4" aria-hidden="true" /> Technical skills
+            </div>
+            {user?.skills?.length ? (
+              <div className="flex flex-wrap gap-1.5">
+                {user.skills.map((skill) => (
+                  <span key={skill} className="badge-stark bg-gray-100 px-2 py-1 text-xs">
+                    {skill}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs italic text-gray-500">No skills added yet.</p>
+            )}
+          </div>
+          <div className="border-t-[1.5px] border-black pt-4">
+            <h4 className="mb-2 flex items-center gap-1.5 text-xs font-black uppercase">
+              <Award className="h-4 w-4" aria-hidden="true" /> Certifications
+            </h4>
+            {user?.certifications?.length ? (
+              <div className="space-y-2">
+                {user.certifications.map((certificate, index) => (
+                  <div key={certificate._id || index} className="flex flex-wrap items-center justify-between gap-2 border border-black bg-gray-50 p-2.5 text-xs">
+                    <span className="font-bold">{certificate.name || certificate.title}</span>
+                    <span className="flex items-center gap-2 text-[10px] text-gray-500">
+                      {certificate.issuer || "Issuer not added"}
+                      {certificate.date && <span>· {certificate.date}</span>}
+                      {certificate.credentialUrl && (
+                        <a href={certificate.credentialUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-black text-black underline">
+                          VERIFY <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                        </a>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyState title="No certifications yet" text="Add certifications from EDIT PORTFOLIO." className="p-5" />
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "projects" && (
+        <div className="animate-fadeIn space-y-3">
+          <h4 className="flex items-center gap-1.5 text-xs font-black uppercase">
+            <FolderKanban className="h-4 w-4" aria-hidden="true" /> Projects
+          </h4>
+          {user?.projects?.length ? (
+            user.projects.map((project, index) => (
+              <div key={project._id || index} className="border-2 border-black bg-gray-50 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-black uppercase">{project.title || project.name}</div>
+                  {project.link && (
+                    <a href={project.link} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[10px] font-black underline">
+                      OPEN <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                    </a>
+                  )}
+                </div>
+                <p className="mt-2 whitespace-pre-wrap text-[12px] font-medium text-gray-600">{project.description || "No description added."}</p>
+                {(project.skills || []).length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-1.5 border-t border-gray-300 pt-3">
+                    {project.skills.map((skill) => (
+                      <span key={skill} className="badge-stark bg-white text-[10px]">
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))
+          ) : (
+            <EmptyState icon={FolderKanban} title="No projects yet" text="Projects you add appear here and power your resume and job matches." />
+          )}
+        </div>
+      )}
+
+      {tab === "experience" && (
+        <div className="animate-fadeIn space-y-3">
+          <h4 className="flex items-center gap-1.5 text-xs font-black uppercase">
+            <BriefcaseBusiness className="h-4 w-4" aria-hidden="true" /> Work history
+          </h4>
+          {user?.experience?.length ? (
+            user.experience.map((item, index) => (
+              <div key={item._id || index} className="border-l-4 border-black bg-gray-50 p-3">
+                <div className="flex flex-col justify-between gap-1 sm:flex-row">
+                  <div>
+                    <h5 className="text-xs font-black uppercase">{item.title || "Role"}</h5>
+                    <div className="text-[11px] font-bold text-gray-600">{item.company || "Company"}</div>
+                  </div>
+                  <span className="text-[10px] font-bold text-gray-500">{item.duration || "Duration not added"}</span>
+                </div>
+                {item.description && <p className="mt-2 whitespace-pre-wrap text-[12px] font-medium text-gray-700">{item.description}</p>}
+              </div>
+            ))
+          ) : (
+            <EmptyState icon={BriefcaseBusiness} title="No experience yet" text="Internships, employment and volunteer work will appear here." />
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FeatureView({ feature, user }) {
+  if (FEATURE_SLOTS[feature]) return <FeatureSlot name={FEATURE_SLOTS[feature]} resetKey={feature} />;
+  if (feature === "portfolio") return <Portfolio user={user} />;
+  if (feature === "mock-interview" || feature === "learning-recommendation") {
+    return (
+      <ErrorBoundary resetKey={feature}>
+        <Suspense fallback={<LoadingState label="LOADING…" />}>
+          {feature === "mock-interview" ? <InterviewWorkspace /> : <LearningRecommendationWorkspace />}
+        </Suspense>
+      </ErrorBoundary>
+    );
+  }
+  return (
+    <EmptyState
+      title="This tool isn't available"
+      text="Go back to Student home and pick another tool."
+      action={
+        <button type="button" onClick={() => openPanel("student.home")} className="btn-primary px-3 py-1.5 text-xs">
+          STUDENT HOME
+        </button>
+      }
+    />
+  );
+}
+
+/** Student workspace (FRONTEND.md §12.1): home tiles, or the active feature behind a back bar. */
+export default function StudentMode({ user }) {
+  const activeFeature = useSelector((state) => state.appContext.activeFeature);
+  const activePanel = useSelector((state) => state.appContext.activePanel);
+  const cgpa = hasValue(user?.cgpa) ? user.cgpa : NOT_SET;
 
   return (
     <div className="space-y-6">
       <div className="card-stark flex flex-col items-start justify-between gap-4 bg-white sm:flex-row sm:items-center">
-        <div>
-          <h2 className="text-lg font-black uppercase tracking-tight">
-            WELCOME BACK, {user?.name || "Alex Rivera"}
-          </h2>
-          <p className="mt-0.5 text-xs font-medium text-gray-600">
-            Branch: <span className="font-bold text-black">{user?.branch || "Computer Science"}</span> | CGPA:{" "}
-            <span className="font-bold text-black">{user?.cgpa || 0.0}</span> | Email:{" "}
-            <span className="font-mono font-bold text-black">{user?.email || "alex.cs2026@ipu.ac.in"}</span>
+        <div className="min-w-0">
+          <h2 className="text-lg font-black uppercase tracking-tight">WELCOME BACK, {user?.name || "STUDENT"}</h2>
+          <p className="mt-0.5 break-words text-xs font-medium text-gray-600">
+            Branch: <span className="font-bold text-black">{user?.branch || NOT_SET}</span> | CGPA:{" "}
+            <span className="font-bold text-black">{cgpa}</span> | Email:{" "}
+            <span className="break-all font-mono font-bold text-black">{user?.email || NOT_SET}</span>
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button onClick={onRefresh} className="btn-secondary cursor-pointer px-3 py-1.5 text-xs">
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-            <span>REFRESH DATA</span>
-          </button>
-          <button onClick={onOpenProfile} className="btn-primary cursor-pointer px-3 py-1.5 text-xs">
-            EDIT PROFILE & SKILLS
-          </button>
-        </div>
+        <button type="button" onClick={() => openPanel("profile")} className="btn-primary min-h-11 shrink-0 px-3 py-1.5 text-xs sm:min-h-0">
+          EDIT PROFILE
+        </button>
       </div>
 
-      {activeFeature === null ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          <FeatureCard
-            icon={Building}
-            title="JOBS FOR ME"
-            description="Placement drives & skill match % fit."
-            badge={`${aiMatchedJobs.length} AI MATCHES`}
-            badgeClass="bg-green-200"
-            onClick={() => {
-              onJobsTabChange("available");
-              onFeatureChange("drives");
-            }}
-          />
-          <FeatureCard
-            icon={User}
-            title="MY PORTFOLIO"
-            description="Manage your Profile, Skills, Projects & Experience in one place."
-            badge="YOUR RESUME"
-            badgeClass="bg-purple-200"
-            onClick={() => {
-              setPortfolioTab("profile");
-              onFeatureChange("portfolio");
-            }}
-          />
-          <FeatureCard
-            icon={Users}
-            title="ALUMNI CONNECT"
-            description="Find mentors matched to your job, resume, and guidance goal."
-            badge="3 BEST MATCHES"
-            badgeClass="bg-purple-100"
-            onClick={onOpenAlumni}
-          />
-          <FeatureCard
-            icon={Mic2}
-            title="MOCK INTERVIEW"
-            description="Practise a job-specific or profile-based interview with AI feedback."
-            badge="AI INTERVIEWER"
-            badgeClass="bg-yellow-200"
-            onClick={onOpenInterview}
-          />
-          <FeatureCard
-            icon={GraduationCap}
-            title="LEARNING ROADMAP"
-            description="Study guides, revision cheat-sheets & practice plans from your mock interviews."
-            badge="AI RECOMMENDER"
-            badgeClass="bg-purple-200"
-            onClick={() => onFeatureChange("learning-recommendation")}
-          />
-          <FeatureCard
-            icon={ClipboardList}
-            title="APPLICATION TRACKING"
-            description="Follow submitted applications and hiring progress."
-            badge={`${applications.length} ACTIVE`}
-            badgeClass="bg-green-100"
-            onClick={() => onFeatureChange("applications")}
-          />
-          <FeatureCard
-            icon={CalendarDays}
-            title="PLACEMENT CALENDAR"
-            description="See company campus drives and application deadlines by date."
-            badge={`${databaseJobs.filter((job) => job.driveDate || job.deadline).length} DATED DRIVES`}
-            badgeClass="bg-yellow-100"
-            onClick={() => onFeatureChange("calendar")}
-          />
-          <FeatureCard
-            icon={BookOpen}
-            title="TRAINING PROGRAMS"
-            description="Aptitude, soft skills, and tech certifications."
-            badge="UPCOMING SESSIONS"
-            badgeClass="bg-blue-100"
-            onClick={() => onFeatureChange("training")}
-          />
-          <FeatureCard
-            icon={Package}
-            title="MY OFFERS"
-            description="View, accept, or reject placement offers. Dream offer upgrades."
-            badge="OFFER INBOX"
-            badgeClass="bg-green-100"
-            onClick={() => onFeatureChange("offers")}
-          />
-        </div>
+      {activeFeature === null || activeFeature === undefined ? (
+        <StudentHome />
       ) : (
         <div className="space-y-4">
-          <div className="flex items-center justify-between border-1.5 border-black bg-white p-2.5 shadow-bold-sm">
-            <button
-              onClick={() => onFeatureChange(null)}
-              className="btn-secondary flex cursor-pointer items-center gap-1.5 px-3 py-1 text-xs font-black"
-            >
-              <ArrowLeft className="h-4 w-4" />
-              <span>BACK TO SQUARE CARDS MENU</span>
-            </button>
-            <span className="badge-stark bg-black text-xs font-extrabold uppercase text-white">
-              {featureNames[activeFeature] || "STUDENT TOOL"}
-            </span>
-          </div>
-
-          <Suspense fallback={<LazyFallback />}>
-            {activeFeature === "drives" && (
-              <DriveGrid
-                aiMatchedJobs={aiMatchedJobs}
-                databaseJobs={databaseJobs}
-                activeTab={activeJobsTab}
-                onTabChange={onJobsTabChange}
-                onApplicationSubmitted={onRefresh}
-              />
-            )}
-
-            {activeFeature === "portfolio" && (
-              <div className="card-stark space-y-4 bg-white">
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b-2 border-black pb-3 gap-3">
-                  <div className="flex w-full sm:w-auto items-center gap-1 overflow-x-auto pb-1 sm:pb-0">
-                    {["profile", "projects", "experience"].map((tab) => (
-                      <button
-                        key={tab}
-                        onClick={() => setPortfolioTab(tab)}
-                        className={`px-3 py-1.5 text-xs font-black uppercase transition-colors whitespace-nowrap ${portfolioTab === tab ? "bg-black text-white" : "bg-gray-100 text-black hover:bg-gray-200"}`}
-                      >
-                        {tab === "profile" ? "Skills & Profile" : tab}
-                      </button>
-                    ))}
-                  </div>
-                  <button onClick={onOpenProfile} className="btn-primary cursor-pointer px-3 py-1.5 text-xs shrink-0">
-                    <Sliders className="h-3.5 w-3.5 inline-block mr-1" />
-                    <span>EDIT PORTFOLIO</span>
-                  </button>
-                </div>
-
-                {portfolioTab === "profile" && (
-                  <div className="space-y-4 animate-in fade-in">
-                    <div className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-3">
-                      {[
-                        ["FULL NAME", user?.name],
-                        ["COLLEGE", user?.collegeName],
-                        ["PASSING YEAR", user?.passingYear],
-                        ["BRANCH", user?.branch],
-                        ["CUMULATIVE CGPA", user?.cgpa],
-                      ].map(([label, value]) => (
-                        <div key={label} className="border-1.5 border-black bg-gray-50 p-3">
-                          <div className="text-[10px] font-extrabold uppercase text-gray-500">{label}</div>
-                          <div className="text-sm font-black">{value || "Not Set"}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <div>
-                      <div className="mb-2 text-xs font-extrabold uppercase flex items-center gap-1"><User className="h-4 w-4" /> RECORDED TECHNICAL SKILLS</div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {user?.skills?.length ? (
-                          user.skills.map((skill) => (
-                            <span key={skill} className="badge-stark bg-gray-100 px-2 py-1 text-xs">{skill}</span>
-                          ))
-                        ) : (
-                          <span className="text-xs text-gray-500 italic">No skills added yet.</span>
-                        )}
-                      </div>
-                    </div>
-
-                    <section className="mt-6 border-t-1.5 border-black pt-4">
-                      <h4 className="mb-2 flex items-center gap-1.5 text-xs font-black uppercase"><Award className="h-4 w-4" /> Certifications</h4>
-                      {user?.certifications?.length ? (
-                        <div className="space-y-2">
-                          {user.certifications.map((certificate, index) => (
-                            <div key={certificate._id || index} className="flex items-center justify-between border border-black p-2.5 text-xs bg-gray-50">
-                              <span className="font-bold">{certificate.name || certificate.title}</span>
-                              <span className="text-[10px] text-gray-500">{certificate.issuer || "Issuer not added"}</span>
-                            </div>
-                          ))}
-                        </div>
-                      ) : <EmptyState text="No certifications added yet." />}
-                    </section>
-                  </div>
-                )}
-
-                {portfolioTab === "projects" && (
-                  <div className="space-y-5 animate-in fade-in">
-                    <section>
-                      <h4 className="mb-2 flex items-center gap-1.5 text-xs font-black uppercase"><FolderKanban className="h-4 w-4" /> Projects</h4>
-                      {user?.projects?.length ? (
-                        <div className="flex flex-col gap-3">
-                          {user.projects.map((project, index) => (
-                            <div key={project._id || index} className="border-2 border-black bg-gray-50 p-4">
-                              <div className="text-sm font-black uppercase">{project.title || project.name}</div>
-                              <p className="mt-2 text-[12px] font-medium text-gray-600 whitespace-pre-wrap">{project.description || "No description added."}</p>
-                              <div className="mt-3 flex flex-wrap gap-1.5 pt-3 border-t border-gray-300">
-                                {(project.skills || []).map((skill) => <span key={skill} className="badge-stark bg-white text-[10px]">{skill}</span>)}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : <EmptyState text="No projects added yet." />}
-                    </section>
-                  </div>
-                )}
-
-                {portfolioTab === "experience" && (
-                  <div className="space-y-4 animate-in fade-in">
-                    <h4 className="mb-2 flex items-center gap-1.5 text-xs font-black uppercase"><BriefcaseBusiness className="h-4 w-4" /> Work History</h4>
-                    {user?.experience?.length ? user.experience.map((item, index) => (
-                      <div key={item._id || index} className="border-l-4 border-black bg-gray-50 p-3">
-                        <div className="flex flex-col justify-between gap-1 sm:flex-row">
-                          <div><h4 className="text-xs font-black uppercase">{item.title || "Role"}</h4><div className="text-[11px] font-bold text-gray-600">{item.company || "Company"}</div></div>
-                          <span className="text-[10px] font-bold text-gray-500">{item.duration || "Duration not added"}</span>
-                        </div>
-                        {item.description && <p className="mt-2 text-[12px] font-medium text-gray-700 whitespace-pre-wrap">{item.description}</p>}
-                      </div>
-                    )) : <EmptyState icon={BriefcaseBusiness} title="No experience added yet" text="Internships, employment and volunteer work will appear here." />}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {activeFeature === "applications" && (
-              <div className="card-stark space-y-4 bg-white">
-                <div className="flex items-center justify-between border-b-2 border-black pb-3">
-                  <div className="flex items-center gap-2"><ClipboardList className="h-5 w-5" /><h3 className="text-sm font-black uppercase">APPLICATION TRACKING</h3></div>
-                  <span className="badge-stark bg-green-100 text-[10px]">LIVE STATUS</span>
-                </div>
-                {applications.length ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full border-collapse text-left text-xs">
-                      <thead><tr className="bg-black text-white"><th className="p-2">COMPANY</th><th className="p-2">ROLE</th><th className="p-2">STATUS</th></tr></thead>
-                      <tbody>{applications.map((drive) => <tr key={drive._id} className="border-b border-black"><td className="p-2 font-bold">{drive.companyName}</td><td className="p-2">{drive.roleTitle}</td><td className="p-2"><span className="badge-stark bg-green-200 text-[9px]">{String(drive.applicationStatus).toUpperCase()}</span></td></tr>)}</tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="border-2 border-dashed border-gray-400 bg-gray-50 p-8 text-center">
-                    <ClipboardList className="mx-auto mb-2 h-7 w-7 text-gray-400" />
-                    <div className="text-xs font-black uppercase">No applications yet</div>
-                    <p className="mt-1 text-[11px] text-gray-500">Apply to a placement drive and its progress will appear here.</p>
-                    <button type="button" onClick={() => onFeatureChange("drives")} className="btn-primary mt-3 px-3 py-1.5 text-xs">EXPLORE JOBS</button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {activeFeature === "calendar" && (
-              <PlacementCalendar drives={databaseJobs} />
-            )}
-            {activeFeature === "training" && (
-              <TrainingHub />
-            )}
-            {activeFeature === "offers" && (
-              <StudentOffers />
-            )}
-            {activeFeature === "mock-interview" && (
-              <InterviewWorkspace />
-            )}
-            {activeFeature === "learning-recommendation" && (
-              <LearningRecommendationWorkspace />
-            )}
-          </Suspense>
+          <BackBar label="STUDENT HOME" title={panelTitle(activePanel)} onBack={() => openPanel("student.home")} />
+          <FeatureView feature={activeFeature} user={user} />
         </div>
       )}
-    </div>
-  );
-}
-
-function EmptyState({ icon: Icon, title, text }) {
-  return (
-    <div className="border-2 border-dashed border-gray-400 bg-gray-50 p-5 text-center">
-      {Icon && <Icon className="mx-auto mb-2 h-7 w-7 text-gray-400" />}
-      {title && <div className="text-xs font-black uppercase">{title}</div>}
-      <p className="text-[11px] font-semibold text-gray-500">{text}</p>
     </div>
   );
 }

@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+/*
+ * Stark design system (FRONTEND.md §15). Component and animation classes live
+ * in @layer components so Tailwind utilities written next to them win
+ * (e.g. `btn-primary bg-red-600`, `badge-stark bg-green-200`, `input-stark pl-8`).
+ */
+
 @layer base {
   :root {
     --color-ink: #000000;
@@ -7,101 +13,184 @@
     --color-muted: #6b6b6b;
   }
 
+  html {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+  }
+
   body {
     background-color: #f8fafc;
     color: #000000;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
     margin: 0;
     padding: 0;
     -webkit-font-smoothing: antialiased;
   }
+
+  :focus-visible {
+    outline: 2px solid #000000;
+    outline-offset: 2px;
+  }
 }
 
-/* Refined UI Utilities — Clean Crisp Borders & No Heavy Shadow Overload */
-.shadow-bold {
-  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.08);
+@layer components {
+  .shadow-bold {
+    box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.08);
+  }
+
+  .shadow-bold-sm {
+    box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  }
+
+  .shadow-bold-md {
+    box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.08);
+  }
+
+  .shadow-bold-lg {
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  }
+
+  .btn-primary {
+    background-color: #000000;
+    color: #ffffff;
+    border: 1.5px solid #000000;
+    font-weight: 700;
+    border-radius: 0px;
+    padding: 0.45rem 0.9rem;
+    transition: background-color 0.15s ease, color 0.15s ease;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .btn-primary:hover {
+    background-color: #262626;
+  }
+
+  .btn-primary:disabled,
+  .btn-secondary:disabled {
+    cursor: not-allowed;
+  }
+
+  .btn-secondary {
+    background-color: #ffffff;
+    color: #000000;
+    border: 1.5px solid #000000;
+    font-weight: 700;
+    border-radius: 0px;
+    padding: 0.45rem 0.9rem;
+    transition: background-color 0.15s ease;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .btn-secondary:hover {
+    background-color: #f5f5f5;
+  }
+
+  .card-stark {
+    background-color: #ffffff;
+    border: 1.5px solid #000000;
+    border-radius: 0px;
+    padding: 1rem;
+  }
+
+  .input-stark {
+    border: 1.5px solid #000000;
+    background-color: #ffffff;
+    border-radius: 0px;
+    padding: 0.45rem 0.75rem;
+    font-weight: 500;
+    transition: border-color 0.15s ease;
+  }
+
+  .input-stark:focus {
+    outline: none;
+    border-color: #000000;
+    background-color: #fafafa;
+  }
+
+  .badge-stark {
+    border: 1.5px solid #000000;
+    background-color: #ffffff;
+    color: #000000;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0px;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .animate-drawer-slide {
+    animation: drawerSlideIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .animate-drawer-slide-out {
+    animation: drawerSlideOut 0.24s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  .animate-fade-overlay {
+    animation: fadeInOverlay 0.25s ease-out forwards;
+  }
+
+  .animate-fade-overlay-out {
+    animation: fadeOutOverlay 0.22s ease-in forwards;
+  }
+
+  .animate-item-up {
+    animation: itemFadeUp 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
 }
 
-.shadow-bold-sm {
-  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+/* 1.5px borders used across the app (border-1.5, border-t-1.5, …). */
+@utility border-1.5 {
+  border-width: 1.5px;
 }
 
-.shadow-bold-lg {
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+@utility border-t-1.5 {
+  border-top-width: 1.5px;
 }
 
-.btn-primary {
-  background-color: #000000;
-  color: #ffffff;
-  border: 1.5px solid #000000;
-  font-weight: 700;
-  border-radius: 0px;
-  padding: 0.45rem 0.9rem;
-  transition: background-color 0.15s ease, color 0.15s ease;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
+@utility border-b-1.5 {
+  border-bottom-width: 1.5px;
 }
 
-.btn-primary:hover {
-  background-color: #262626;
+@utility border-l-1.5 {
+  border-left-width: 1.5px;
 }
 
-.btn-secondary {
-  background-color: #ffffff;
-  color: #000000;
-  border: 1.5px solid #000000;
-  font-weight: 700;
-  border-radius: 0px;
-  padding: 0.45rem 0.9rem;
-  transition: background-color 0.15s ease;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
+@utility border-r-1.5 {
+  border-right-width: 1.5px;
 }
 
-.btn-secondary:hover {
-  background-color: #f5f5f5;
+@utility scrollbar-hide {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
 
-.card-stark {
-  background-color: #ffffff;
-  border: 1.5px solid #000000;
-  border-radius: 0px;
-  padding: 1rem;
+@utility animate-fadeIn {
+  animation: fadeIn 0.25s ease-out both;
 }
 
-.input-stark {
-  border: 1.5px solid #000000;
-  background-color: #ffffff;
-  border-radius: 0px;
-  padding: 0.45rem 0.75rem;
-  font-weight: 500;
-  transition: border-color 0.15s ease;
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
-.input-stark:focus {
-  outline: none;
-  border-color: #000000;
-  background-color: #fafafa;
-}
-
-.badge-stark {
-  border: 1.5px solid #000000;
-  background-color: #ffffff;
-  color: #000000;
-  font-size: 0.75rem;
-  font-weight: 700;
-  padding: 0.125rem 0.5rem;
-  border-radius: 0px;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-}
-
-/* Subtle Drawer Keyframe Animations (Slide-In & Slide-Out) */
 @keyframes drawerSlideIn {
   from {
     transform: translateX(100%);
@@ -152,22 +241,13 @@
   }
 }
 
-.animate-drawer-slide {
-  animation: drawerSlideIn 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-
-.animate-drawer-slide-out {
-  animation: drawerSlideOut 0.24s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-
-.animate-fade-overlay {
-  animation: fadeInOverlay 0.25s ease-out forwards;
-}
-
-.animate-fade-overlay-out {
-  animation: fadeOutOverlay 0.22s ease-in forwards;
-}
-
-.animate-item-up {
-  animation: itemFadeUp 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

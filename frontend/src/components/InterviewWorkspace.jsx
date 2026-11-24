@@ -21,44 +21,53 @@ import {
   X,
 } from "lucide-react";
 import { useDispatch, useSelector } from "react-redux";
-import { sendAIMessage } from "../services/aiRequestHandler";
+import { sendAIMessage } from "../services/aiRequestHandler.js";
 import {
   journeyJobSelected,
   selectAILoading,
   selectInterviewHistory,
   selectInterviewWorkspace,
-} from "../store/aiChatSlice";
-import { INTERVIEW_ANSWER_WINDOW_EVENT } from "./VoiceInterviewInput";
-import { socket } from "../lib/socket";
-import { api } from "../lib/api";
-import RecommendedResources from "./RecommendedResources";
+} from "../store/aiChatSlice.js";
+import { socket } from "../lib/socket.js";
+import { errorMessage } from "../lib/http.js";
+import { useAsync } from "../ui/useAsync.js";
+import { listCampusJobs, toAgentJob, toJobVM } from "../workspace/featureModules.js";
+import { INTERVIEW_ANSWER_WINDOW_EVENT } from "../workspace/interviewEvents.js";
+import RecommendedResources from "./RecommendedResources.jsx";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+// Interview scores are 0–10 end to end (Python report prompt, Node clamps to 0–10).
+// A value above 10 can only come from an old 0–100 record, so it is rescaled.
+
+const toTenScale = (value) => {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return 0;
+  return Math.min(10, number > 10 ? number / 10 : number);
+};
+
+const formatScore = (value) => {
+  const score = toTenScale(value);
+  return Number.isInteger(score) ? String(score) : score.toFixed(1);
+};
 
 const scoreColor = (score) =>
-  score >= 75
-    ? "bg-green-300 text-green-900"
-    : score >= 50
-    ? "bg-yellow-300 text-yellow-900"
-    : "bg-red-300 text-red-900";
+  score >= 7.5 ? "bg-green-300 text-green-900" : score >= 5 ? "bg-yellow-300 text-yellow-900" : "bg-red-300 text-red-900";
 
-const scoreBorder = (score) =>
-  score >= 75 ? "border-green-400" : score >= 50 ? "border-yellow-400" : "border-red-400";
+const scoreBorder = (score) => (score >= 7.5 ? "border-green-400" : score >= 5 ? "border-yellow-400" : "border-red-400");
+
+const scoreVerdict = (score) => (score >= 7.5 ? "EXCELLENT" : score >= 5 ? "GOOD" : "NEEDS WORK");
 
 function ScoreBar({ label, score = 0 }) {
-  const safeScore = Math.max(0, Math.min(100, Number(score) || 0));
-  const color = safeScore >= 75 ? "bg-green-400" : safeScore >= 50 ? "bg-yellow-400" : "bg-red-400";
+  const safeScore = toTenScale(score);
+  const color = safeScore >= 7.5 ? "bg-green-400" : safeScore >= 5 ? "bg-yellow-400" : "bg-red-400";
   return (
     <div>
       <div className="mb-1 flex items-center justify-between text-[10px] font-black uppercase">
         <span>{label}</span>
-        <span className="font-mono">{safeScore.toFixed(0)}/100</span>
+        <span className="font-mono tabular-nums">{formatScore(safeScore)}/10</span>
       </div>
       <div className="h-2.5 border border-black bg-gray-100">
-        <div
-          className={`h-full transition-all duration-700 ${color}`}
-          style={{ width: `${safeScore}%` }}
-        />
+        <div className={`h-full transition-all duration-700 ${color}`} style={{ width: `${safeScore * 10}%` }} />
       </div>
     </div>
   );
@@ -69,7 +78,7 @@ function ScoreBar({ label, score = 0 }) {
 function ReportCard({ report, compact = false }) {
   const technical = report?.scores?.technical || {};
   const communication = report?.scores?.communication || {};
-  const overall = Number(report?.overall_score || 0);
+  const overall = toTenScale(report?.overall_score);
   const positives = [
     ...(report?.positives?.technical?.technical_skills || []),
     ...(report?.positives?.technical?.problem_solving || []),
@@ -86,8 +95,9 @@ function ReportCard({ report, compact = false }) {
             overall
           )}`}
         >
-          <div className={`text-4xl font-black tabular-nums ${compact ? "text-3xl" : ""}`}>
-            {overall.toFixed(0)}
+          <div className={`font-black tabular-nums ${compact ? "text-3xl" : "text-4xl"}`}>
+            {formatScore(overall)}
+            <span className="text-base">/10</span>
           </div>
           <div className="mt-1 text-[10px] font-black uppercase tracking-widest">Overall Score</div>
           <div
@@ -95,7 +105,7 @@ function ReportCard({ report, compact = false }) {
               overall
             )} ${scoreColor(overall)}`}
           >
-            {overall >= 75 ? "EXCELLENT" : overall >= 50 ? "GOOD" : "NEEDS WORK"}
+            {scoreVerdict(overall)}
           </div>
         </div>
 
@@ -140,7 +150,7 @@ function ReportCard({ report, compact = false }) {
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             {report.topics.map((topic, i) => (
-              <div key={`${topic.topic}-${i}`} className="border-1.5 border-black bg-white p-2">
+              <div key={`${topic.topic}-${i}`} className="border-[1.5px] border-black bg-white p-2">
                 <ScoreBar label={topic.topic || "General"} score={topic.score} />
               </div>
             ))}
@@ -184,13 +194,13 @@ function ReportCard({ report, compact = false }) {
 // ─── Past Result Mini-Card ────────────────────────────────────────────────────
 
 function HistoryCard({ entry, onExpand, expanded }) {
-  const overall = Number(entry?.report?.overall_score || 0);
+  const overall = toTenScale(entry?.report?.overall_score);
   const date = entry?.completedAt
     ? new Date(entry.completedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })
     : "—";
 
   return (
-    <div className="border-1.5 border-black bg-white">
+    <div className="border-[1.5px] border-black bg-white">
       <button
         type="button"
         onClick={onExpand}
@@ -202,7 +212,7 @@ function HistoryCard({ entry, onExpand, expanded }) {
               overall
             )}`}
           >
-            {overall.toFixed(0)}
+            {formatScore(overall)}
           </div>
           <div>
             <div className="text-xs font-black uppercase">{entry?.report?.meta?.role || "General Interview"}</div>
@@ -217,7 +227,7 @@ function HistoryCard({ entry, onExpand, expanded }) {
         </div>
       </button>
       {expanded && (
-        <div className="border-t-1.5 border-black p-4">
+        <div className="border-t-[1.5px] border-black p-4">
           <ReportCard report={entry.report} compact />
         </div>
       )}
@@ -237,43 +247,16 @@ export default function InterviewWorkspace() {
   const [activeTab, setActiveTab] = useState("results"); // "results" | "resources"
   const [expandedHistoryId, setExpandedHistoryId] = useState(null);
 
-  // Database jobs picker state
-  const [dbJobs, setDbJobs] = useState([]);
-  const [loadingDbJobs, setLoadingDbJobs] = useState(false);
-  const [dbJobsError, setDbJobsError] = useState(null);
+  // Campus-drive picker (opportunities' listCampusJobs + JobVM), loaded while a job is being chosen.
+  const awaitingJob = workspace.status === "awaiting-job";
   const [searchQuery, setSearchQuery] = useState("");
   const [jobSelectionMode, setJobSelectionMode] = useState("db"); // "db" | "url"
-
-  // Fetch jobs from DB whenever the workspace moves into "awaiting-job" state
-  useEffect(() => {
-    if (workspace.status === "awaiting-job") {
-      let isMounted = true;
-      const fetchJobsFromBackend = async () => {
-        setLoadingDbJobs(true);
-        setDbJobsError(null);
-        try {
-          const res = await api.getJobs();
-          const raw = res?.data || res?.jobs || res || [];
-          const list = Array.isArray(raw) ? raw : [];
-          if (isMounted) {
-            setDbJobs(list);
-          }
-        } catch (err) {
-          console.error("Failed to query DB jobs for mock interview:", err);
-          if (isMounted) {
-            setDbJobsError("Unable to load campus jobs from database.");
-          }
-        } finally {
-          if (isMounted) setLoadingDbJobs(false);
-        }
-      };
-
-      fetchJobsFromBackend();
-      return () => {
-        isMounted = false;
-      };
-    }
-  }, [workspace.status]);
+  const jobsQuery = useAsync(() => listCampusJobs({ limit: 50 }), [awaitingJob], { enabled: awaitingJob });
+  const campusJobs = (Array.isArray(jobsQuery.data?.items) ? jobsQuery.data.items : []).map((item) =>
+    item && typeof item === "object" && "roleTitle" in item && "companyName" in item ? item : toJobVM(item, "campus"),
+  );
+  const loadingDbJobs = jobsQuery.loading;
+  const dbJobsError = jobsQuery.error ? errorMessage(jobsQuery.error, "Unable to load campus drives.") : null;
 
   // Handle server-streamed audio responses
   useEffect(() => {
@@ -334,18 +317,11 @@ export default function InterviewWorkspace() {
     dispatch(sendAIMessage({ text, details, modeName: "ai-interviewer", source, feature: "mock-interview" }));
   };
 
-  const handleSelectDbJob = (job) => {
+  const handleSelectDbJob = (vm) => {
     if (loading) return;
-    const title = job.title || job.job_title || "Available Role";
-    const companyName =
-      job.company?.name || job.companyName || (typeof job.company === "string" ? job.company : "Company");
-
-    dispatch(journeyJobSelected(job));
-    send(
-      `I want to interview for ${title} at ${companyName}`,
-      "mock-interview-db-job-select",
-      { selected_job: job }
-    );
+    const agentJob = toAgentJob(vm);
+    dispatch(journeyJobSelected(agentJob));
+    send(`I want to interview for ${vm.roleTitle} at ${vm.companyName}`, "mock-interview-db-job-select", { selected_job: agentJob });
   };
 
   const handleRequestResources = () => {
@@ -357,18 +333,15 @@ export default function InterviewWorkspace() {
     send(msg, "mock-interview-resources");
   };
 
-  // Filter DB jobs by search query
-  const filteredDbJobs = dbJobs.filter((job) => {
-    if (!searchQuery.trim()) return true;
-    const query = searchQuery.toLowerCase();
-    const title = (job.title || job.job_title || "").toLowerCase();
-    const company = (
-      job.company?.name || job.companyName || (typeof job.company === "string" ? job.company : "")
-    ).toLowerCase();
-    const location = (job.location || "").toLowerCase();
-    const skills = Array.isArray(job.skills) ? job.skills.join(" ").toLowerCase() : "";
-    return title.includes(query) || company.includes(query) || location.includes(query) || skills.includes(query);
-  });
+  // Filter campus drives by search query
+  const query = searchQuery.trim().toLowerCase();
+  const filteredDbJobs = query
+    ? campusJobs.filter((vm) =>
+        [vm.roleTitle, vm.companyName, vm.location, ...(vm.skillsRequired || [])]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query)),
+      )
+    : campusJobs;
 
   const liveReport = workspace.status === "complete" ? workspace.report : null;
 
@@ -498,7 +471,7 @@ export default function InterviewWorkspace() {
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Search drives by role, company, skills, or location..."
-                    className="input-stark w-full pl-8 pr-8 text-xs"
+                    className="input-stark w-full pl-8 pr-8 text-base sm:text-xs"
                   />
                   {searchQuery && (
                     <button
@@ -519,7 +492,7 @@ export default function InterviewWorkspace() {
               {loadingDbJobs && (
                 <div className="flex items-center justify-center gap-2 border-2 border-dashed border-black bg-gray-50 p-8 text-xs font-bold">
                   <Sparkles className="h-4 w-4 animate-spin text-black" />
-                  <span>FETCHING AVAILABLE JOBS FROM DATABASE...</span>
+                  <span>LOADING CAMPUS DRIVES…</span>
                 </div>
               )}
 
@@ -529,15 +502,7 @@ export default function InterviewWorkspace() {
                   <span>{dbJobsError}</span>
                   <button
                     type="button"
-                    onClick={() => {
-                      setLoadingDbJobs(true);
-                      setDbJobsError(null);
-                      api
-                        .getJobs()
-                        .then((res) => setDbJobs(res?.data || res?.jobs || res || []))
-                        .catch(() => setDbJobsError("Unable to load campus jobs."))
-                        .finally(() => setLoadingDbJobs(false));
-                    }}
+                    onClick={jobsQuery.reload}
                     className="btn-secondary px-2.5 py-1 text-[10px]"
                   >
                     RETRY
@@ -548,55 +513,50 @@ export default function InterviewWorkspace() {
               {/* Jobs Cards Grid */}
               {!loadingDbJobs && !dbJobsError && filteredDbJobs.length > 0 && (
                 <div className="grid max-h-[460px] gap-3 overflow-y-auto pr-1 sm:grid-cols-1 md:grid-cols-2">
-                  {filteredDbJobs.map((job) => {
-                    const title = job.title || job.job_title || "Available Role";
-                    const companyName =
-                      job.company?.name ||
-                      job.companyName ||
-                      (typeof job.company === "string" ? job.company : "Company");
-                    const salary = job.salary || "Not disclosed";
-                    const location = job.location || "On-site / Remote";
-                    const employmentType = job.employmentType || job.employment_type || "Full-Time";
-                    const skills = Array.isArray(job.skills) ? job.skills : [];
-                    const id = job._id || job.job_id || job.id;
+                  {filteredDbJobs.map((vm, index) => {
+                    const salary = vm.salaryText || "Not disclosed";
+                    const employmentType = vm.jobType || "Campus drive";
+                    const skills = Array.isArray(vm.skillsRequired) ? vm.skillsRequired : [];
 
                     return (
                       <div
-                        key={id}
+                        key={vm.id || index}
                         className="group flex flex-col justify-between border-2 border-black bg-white p-3.5 shadow-bold-sm transition-all hover:-translate-y-0.5 hover:bg-gray-50"
                       >
                         <div className="space-y-2">
                           <div className="flex items-start justify-between gap-2">
-                            <div>
+                            <div className="min-w-0">
                               <span className="badge-stark bg-black text-[9px] text-white">
-                                {employmentType.toUpperCase()}
+                                {String(employmentType).toUpperCase()}
                               </span>
-                              <h4 className="mt-1 text-xs font-black uppercase tracking-tight line-clamp-1">
-                                {title}
+                              <h4 className="mt-1 line-clamp-1 text-xs font-black uppercase tracking-tight">
+                                {vm.roleTitle}
                               </h4>
-                              <p className="text-[11px] font-bold text-gray-700 flex items-center gap-1">
-                                <Building2 className="h-3 w-3" />
-                                <span>{companyName}</span>
+                              <p className="flex items-center gap-1 text-[11px] font-bold text-gray-700">
+                                <Building2 className="h-3 w-3 shrink-0" />
+                                <span className="truncate">{vm.companyName}</span>
                               </p>
                             </div>
-                            <span className="badge-stark bg-green-100 text-[9px] font-mono font-bold shrink-0">
+                            <span className="badge-stark shrink-0 bg-green-100 font-mono text-[9px] font-bold">
                               {salary}
                             </span>
                           </div>
 
-                          <div className="flex flex-wrap items-center gap-1 text-[10px] text-gray-600 font-medium">
-                            <span className="flex items-center gap-0.5">
-                              <MapPin className="h-3 w-3" /> {location}
-                            </span>
-                            {job.minimumCgpa !== undefined && job.minimumCgpa !== null && (
+                          <div className="flex flex-wrap items-center gap-1 text-[10px] font-medium text-gray-600">
+                            {vm.location && (
+                              <span className="flex items-center gap-0.5">
+                                <MapPin className="h-3 w-3" /> {vm.location}
+                              </span>
+                            )}
+                            {vm.minCgpa !== undefined && vm.minCgpa !== null && (
                               <span className="badge-stark bg-gray-100 text-[9px]">
-                                Min CGPA: {job.minimumCgpa}
+                                Min CGPA: {vm.minCgpa}
                               </span>
                             )}
                           </div>
 
                           {skills.length > 0 && (
-                            <div className="flex flex-wrap gap-1 pt-1 border-t border-gray-200">
+                            <div className="flex flex-wrap gap-1 border-t border-gray-200 pt-1">
                               {skills.slice(0, 5).map((skill, sIdx) => (
                                 <span key={sIdx} className="badge-stark bg-blue-50 text-[9px]">
                                   {skill}
@@ -611,12 +571,12 @@ export default function InterviewWorkspace() {
                           )}
                         </div>
 
-                        <div className="mt-3 pt-2 border-t-1.5 border-black">
+                        <div className="mt-3 border-t-[1.5px] border-black pt-2">
                           <button
                             type="button"
                             disabled={loading}
-                            onClick={() => handleSelectDbJob(job)}
-                            className="btn-primary w-full justify-center py-1.5 text-[11px]"
+                            onClick={() => handleSelectDbJob(vm)}
+                            className="btn-primary min-h-11 w-full justify-center py-1.5 text-[11px] disabled:opacity-50 sm:min-h-0"
                           >
                             <Sparkles className="h-3 w-3" />
                             <span>PRACTICE FOR THIS ROLE</span>
@@ -632,7 +592,7 @@ export default function InterviewWorkspace() {
               {!loadingDbJobs && !dbJobsError && filteredDbJobs.length === 0 && (
                 <div className="border-2 border-dashed border-black bg-gray-50 p-6 text-center">
                   <BriefcaseBusiness className="mx-auto mb-2 h-6 w-6 text-gray-400" />
-                  <div className="text-xs font-black uppercase">No matching jobs in database</div>
+                  <div className="text-xs font-black uppercase">No matching campus drives</div>
                   <p className="mt-1 text-[11px] text-gray-600">
                     Try searching for another keyword, or switch to paste a custom job link URL.
                   </p>
@@ -674,9 +634,9 @@ export default function InterviewWorkspace() {
                   value={jobLink}
                   onChange={(event) => setJobLink(event.target.value)}
                   placeholder="https://company.com/careers/software-engineer"
-                  className="input-stark flex-1 text-xs"
+                  className="input-stark flex-1 text-base sm:text-xs"
                 />
-                <button type="submit" disabled={loading || !jobLink.trim()} className="btn-primary px-4 py-2 text-xs">
+                <button type="submit" disabled={loading || !jobLink.trim()} className="btn-primary min-h-11 px-4 py-2 text-xs sm:min-h-0">
                   <Send className="h-3.5 w-3.5" /> USE LINK
                 </button>
               </div>
@@ -723,9 +683,9 @@ export default function InterviewWorkspace() {
               ? "ANSWER WINDOW STARTED"
               : "PREPARING INTERVIEWER AUDIO"}
           </span>
-          <div className="border-1.5 border-black bg-blue-50 p-3 text-[11px] font-semibold">
+          <div className="border-[1.5px] border-black bg-blue-50 p-3 text-[11px] font-semibold">
             The microphone starts automatically when the server-generated question audio ends. Your answer is sent
-            after four seconds of silence, when you click Finish answer, or when the 60-second maximum expires.
+            after four seconds of silence, when you click Finish answer, or when the answer time runs out.
           </div>
           {(voiceStatus === "blocked" || voiceStatus === "error") && (
             <button
@@ -773,7 +733,7 @@ export default function InterviewWorkspace() {
             >
               <BookOpen className="h-3.5 w-3.5" /> Recommended Resources
               {workspace.report?.skill_gaps?.length > 0 && (
-                <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-purple-600 text-[8px] text-white">
+                <span className="ml-1 flex h-4 min-w-4 items-center justify-center border border-black bg-purple-200 px-0.5 text-[9px] text-black">
                   {workspace.report.skill_gaps.length}
                 </span>
               )}

@@ -9,9 +9,9 @@ import {
   Sparkles,
   Wand2,
 } from "lucide-react";
-import { api } from "../lib/api";
-import { sendAIMessage } from "../services/aiRequestHandler";
-import { setUserContext } from "../store/appContextSlice";
+import { api } from "../lib/api.js";
+import { refreshCurrentUser } from "../features/auth/session.js";
+import { sendAIMessage } from "../services/aiRequestHandler.js";
 import {
   prOutreachDraftUpdated,
   prOutreachSendFailed,
@@ -19,7 +19,18 @@ import {
   prOutreachSendSucceeded,
   selectAILoading,
   selectPROutreachWorkspace,
-} from "../store/aiChatSlice";
+} from "../store/aiChatSlice.js";
+
+const GMAIL_ERROR_COPY = {
+  denied: "Gmail connection was cancelled.",
+};
+
+// One-time banner from the Gmail OAuth redirect (`/?gmail_error=…`).
+const initialGmailError = () => {
+  if (typeof window === "undefined") return null;
+  const value = new URLSearchParams(window.location.search).get("gmail_error");
+  return value ? GMAIL_ERROR_COPY[value] || "Could not connect Gmail. Please try again." : null;
+};
 
 const STATUS_COPY = {
   idle: "Waiting for your brief",
@@ -43,38 +54,27 @@ export default function PROutreach() {
   const isSent = draft.sendStatus === "sent";
 
   const gmailConnected = Boolean(user?.gmailConnection?.connectedEmail);
-  const [gmailBannerError, setGmailBannerError] = useState(null);
+  const [gmailBannerError, setGmailBannerError] = useState(initialGmailError);
   const [isConnectingGmail, setIsConnectingGmail] = useState(false);
 
-  const refreshUser = async () => {
-    const response = await api.getMe();
-    const updatedUser = response.data;
-    dispatch(setUserContext(updatedUser));
-    localStorage.setItem("user", JSON.stringify(updatedUser));
-  };
+  const refreshUser = () =>
+    dispatch(refreshCurrentUser()).catch((error) =>
+      setGmailBannerError(error?.message || "Couldn't refresh your Gmail connection status."),
+    );
 
+  // Gmail OAuth comes back to `/?gmail_connected=1` (or `gmail_error=…`): refresh the user once,
+  // then drop only those keys so other deep-link parameters stay intact.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const gmailConnectedParam = params.get("gmail_connected");
-    const gmailErrorParam = params.get("gmail_error");
-
-    if (gmailConnectedParam) {
-      refreshUser();
-    } else if (gmailErrorParam) {
-      // One-time sync from the OAuth redirect's query param, not a state cascade.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setGmailBannerError(
-        gmailErrorParam === "denied"
-          ? "Gmail connection was cancelled."
-          : "Could not connect Gmail. Please try again."
-      );
+    if (!params.has("gmail_connected") && !params.has("gmail_error")) return;
+    if (params.has("gmail_connected")) {
+      dispatch(refreshCurrentUser()).catch(() => {});
     }
-
-    if (gmailConnectedParam || gmailErrorParam) {
-      window.history.replaceState({}, "", window.location.pathname);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    params.delete("gmail_connected");
+    params.delete("gmail_error");
+    const rest = params.toString();
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+  }, [dispatch]);
 
   const confidence = useMemo(() => {
     const value = Number(draft.confidenceScore);

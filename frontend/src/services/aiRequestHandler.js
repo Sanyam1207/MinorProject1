@@ -1,60 +1,67 @@
-import { ensureSocketAuthentication, socket } from "../lib/socket";
+// AI chat transport: sends `query` over the shared socket, routes every
+// `response` chunk into Redux and turns headers / copilot tool results into
+// UI actions for the right-hand workspace (FRONTEND.md §8).
+import { ensureSocketAuthentication, socket } from "../lib/socket.js";
 import {
   connectionChanged,
-  ensureWelcomeMessage,
   conversationOpened,
+  ensureWelcomeMessage,
+  interviewTranscriptUpdated,
   newChatStarted,
   requestFailed,
   requestStarted,
   responseReceived,
-  interviewTranscriptUpdated,
-} from "../store/aiChatSlice";
-import { setActiveFeature, setActiveJobsTab, setActiveResumeTool, setAgentMode, setUserMode } from "../store/appContextSlice";
-import { getAIFeature } from "./aiFeatureRegistry";
+} from "../store/aiChatSlice.js";
+import { setActiveJobsTab, setAgentMode } from "../store/appContextSlice.js";
+import { bootstrapSession } from "../features/auth/session.js";
+import { toastError, toastSuccess } from "../ui/toast.js";
+import { agentModeForHeader, agentModeForMessages, isCopilotHeader, isFailureHeader } from "../workspace/agentModes.js";
+import { copilotUiActions, routeHeader } from "../workspace/headerRoutes.js";
+import { isModeAllowed } from "../workspace/modes.js";
+import { resolveTarget } from "../workspace/panels.js";
+import { applyUiActions } from "../workspace/uiActions.js";
+import { getAIFeature } from "./aiFeatureRegistry.js";
 
-// Collection/generation calls can include more than one Gemini round trip.
-// Keep the UI request alive while the Python agent is still processing.
-const RESPONSE_TIMEOUT_MS = 90000;
+export { AGENT_MODE_BY_HEADER } from "../workspace/agentModes.js";
+
+// Longer than Node's 120 s AI_IDLE_TIMEOUT_MS, so Node's terminal chunk normally arrives first.
+const RESPONSE_TIMEOUT_MS = 130000;
 const FALLBACK_ERROR_TEXT = "I am having trouble fetching live DB tool data at the moment. Please try asking again!";
-const AGENT_MODE_BY_HEADER = {
-  "mode:switch:jobs": "jobs-finder",
-  "mode:switch:resume": "resume-generator",
-  "mode:switch:job-eligibility": "job-eligibility",
-  "mode:switch:job-creation": "job-creation",
-  "mode:jobparser:jobslist": "jobs-finder",
-  "mode:jobparser:eligibility": "job-eligibility",
-  "resume_generator": "resume-generator",
-  "resume-generator": "resume-generator",
-  "mode:jobCreation:data": "job-creation",
-  "mode:jobCreation:ready": "job-creation",
-  "mode:jobCreation:post": "job-creation",
-  "mode:jobCreation:error": "job-creation",
-  "mode:switch:pr-outreach": "pr_outreach",
-  "mail:review": "pr_outreach",
-  "pr_outreach_satisfied": "pr_outreach",
-  "pr_outreach_completed": "pr_outreach",
-  "mode:switch:alumni-connect": "alumni-connect",
-  "alumni_connect": "alumni-connect",
-  "alumni:matches": "alumni-connect",
-  "alumni:request-review": "alumni-connect",
-  "alumni:resume-share-review": "alumni-connect",
-  "alumni_connect_completed": "alumni-connect",
-  "mode:switch:ai-interviewer": "ai-interviewer",
-  "button:options": "ai-interviewer",
-  "select:job:db": "ai-interviewer",
-  "text:mode:interview": "ai-interviewer",
-  "interview:end": "ai-interviewer",
-  // Gap Analysis
-  "mode:switch:gap-analysis": "gap-analysis",
-  "mode:gapAnalysis:analysis": "gap-analysis",
-  "mode:gapAnalysis:suggestions": "gap-analysis",
-  "mode:gapAnalysis:error": "gap-analysis",
-  // Learning recommendation
-  "mode:switch:learning-recommendation": "learning-recommendation",
-  "select:interview:db": "learning-recommendation",
-  "learning:recommendations": "learning-recommendation",
-  "learning:recommendations-error": "learning-recommendation",
-};
+
+const newId = () => crypto.randomUUID();
+
+const userSummary = (user, role) =>
+  user
+    ? {
+      id: user._id || user.id || null,
+      name: user.name || null,
+      email: user.email || null,
+      role,
+      branch: user.branch || null,
+      skills: Array.isArray(user.skills) ? user.skills : [],
+    }
+    : null;
+
+const pastMessages = (messages) =>
+  messages.slice(-8).map((message) => ({
+    role: message.sender === "user" ? "user" : "assistant",
+    content: message.text || "",
+  }));
+
+/** What the copilot should know about the workspace on screen (FRONTEND.md §8.1). */
+const uiContextFor = (appContext) => ({
+  mode: appContext.activeMode,
+  panel: appContext.activePanel,
+  params: appContext.panelParams[appContext.activePanel] ?? {},
+});
+
+/** mode_name: explicit → mode-implied → sticky agent → teacher copilot → null (FRONTEND.md §8.1). */
+const resolveModeName = (modeName, appContext) =>
+  modeName ||
+  (appContext.activeMode === "pr_outreach" ? "pr_outreach" : appContext.activeMode === "alumni_connect" ? "alumni-connect" : null) ||
+  appContext.agentMode ||
+  (appContext.activeMode === "teacher" ? "copilot" : null) ||
+  null;
 
 class AIRequestHandler {
   constructor() {
@@ -78,13 +85,18 @@ class AIRequestHandler {
     socket.on("interview:audio:error", (payload) => {
       if (!payload?.requestId || payload.code === "TTS_FAILED") return;
       const request = store.getState().aiChat.requests[payload.requestId];
-      if (request && request.status !== "completed") {
+      if (request && request.status !== "completed" && request.status !== "failed") {
         this.clearTimeout(payload.requestId);
         store.dispatch(requestFailed({ requestId: payload.requestId, message: payload.message }));
       }
     });
     store.dispatch(connectionChanged(socket.connected));
-    store.dispatch(ensureWelcomeMessage(store.getState().appContext.user?.name || "Student"));
+
+    const state = store.getState();
+    // A reload restores the sticky agent from the last bot message (so "Confirm" still reaches the copilot).
+    store.dispatch(setAgentMode(agentModeForMessages(state.aiChat.messages)));
+    const user = state.appContext.user;
+    if (user) store.dispatch(ensureWelcomeMessage({ name: user.name, role: user.role }));
   }
 
   send({ text, details = {}, modeName, source = "chat", feature = null }) {
@@ -94,46 +106,34 @@ class AIRequestHandler {
     if (!cleanText) return null;
 
     const state = this.store.getState();
-    const requestId = crypto.randomUUID();
+    const { appContext, aiChat } = state;
+    const requestId = newId();
     const createdAt = new Date().toISOString();
-    const user = state.appContext.user;
-    const effectiveModeName = modeName || (
-      state.appContext.activeMode === "pr_outreach" ? "pr_outreach" :
-        state.appContext.activeMode === "alumni_connect" ? "alumni-connect" : state.appContext.agentMode
-    );
+    const effectiveModeName = resolveModeName(modeName, appContext);
     const payload = {
       requestId,
-      sessionId: state.aiChat.sessionId,
+      sessionId: aiChat.sessionId,
       user_query: cleanText,
-      user_role: state.appContext.userRole,
-      user_mode: state.appContext.activeMode,
+      user_role: appContext.userRole,
+      user_mode: appContext.activeMode,
       mode_name: effectiveModeName,
       source,
       feature,
-      user: user ? {
-        id: user._id || user.id || null,
-        name: user.name || null,
-        email: user.email || null,
-        role: state.appContext.userRole,
-        branch: user.branch || null,
-        skills: Array.isArray(user.skills) ? user.skills : [],
-      } : null,
+      user: userSummary(appContext.user, appContext.userRole),
       details: {
-        ...state.appContext.details,
-        selected_job: state.aiChat.journey.selectedJob,
-        resume: state.aiChat.journey.resume,
+        ...appContext.details,
+        selected_job: aiChat.journey.selectedJob,
+        resume: aiChat.journey.resume,
         ...details,
+        ui_context: details?.ui_context ?? uiContextFor(appContext),
       },
-      past_messages: state.aiChat.messages.slice(-8).map((message) => ({
-        role: message.sender === "user" ? "user" : "assistant",
-        content: message.text || "",
-      })),
+      past_messages: pastMessages(aiChat.messages),
     };
     if (
       (effectiveModeName === "pr_outreach" || effectiveModeName === "pr-outreach") &&
-      state.aiChat.prOutreachWorkspace.sendStatus !== "sent"
+      aiChat.prOutreachWorkspace.sendStatus !== "sent"
     ) {
-      const draft = state.aiChat.prOutreachWorkspace;
+      const draft = aiChat.prOutreachWorkspace;
       payload.mail_draft = {
         to: draft.to,
         subject: draft.subject,
@@ -144,10 +144,10 @@ class AIRequestHandler {
     }
     if (
       (effectiveModeName === "alumni-connect" || effectiveModeName === "alumni_connect") &&
-      state.aiChat.alumniWorkspace.draft &&
-      state.aiChat.alumniWorkspace.sendStatus !== "sent"
+      aiChat.alumniWorkspace.draft &&
+      aiChat.alumniWorkspace.sendStatus !== "sent"
     ) {
-      const draft = state.aiChat.alumniWorkspace.draft;
+      const draft = aiChat.alumniWorkspace.draft;
       payload.alumni_request_draft = {
         alumni_id: draft.alumni_id,
         alumni_name: draft.alumni_name,
@@ -161,20 +161,22 @@ class AIRequestHandler {
     }
     if (
       (effectiveModeName === "alumni-connect" || effectiveModeName === "alumni_connect") &&
-      state.aiChat.alumniWorkspace.resumeShareDraft &&
-      state.aiChat.alumniWorkspace.resumeShareStatus !== "shared"
+      aiChat.alumniWorkspace.resumeShareDraft &&
+      aiChat.alumniWorkspace.resumeShareStatus !== "shared"
     ) {
-      payload.resume_share_draft = state.aiChat.alumniWorkspace.resumeShareDraft;
+      payload.resume_share_draft = aiChat.alumniWorkspace.resumeShareDraft;
     }
 
-    this.store.dispatch(requestStarted({
-      requestId,
-      userMessageId: crypto.randomUUID(),
-      assistantMessageId: crypto.randomUUID(),
-      text: cleanText,
-      createdAt,
-      payload,
-    }));
+    this.store.dispatch(
+      requestStarted({
+        requestId,
+        userMessageId: newId(),
+        assistantMessageId: newId(),
+        text: cleanText,
+        createdAt,
+        payload,
+      }),
+    );
 
     if (modeName) this.store.dispatch(setAgentMode(modeName));
 
@@ -188,14 +190,13 @@ class AIRequestHandler {
   startInterviewAudio({ sampleRate, questionNumber, onAcknowledged }) {
     if (!this.store) throw new Error("AI request handler has not been initialized");
 
-    const state = this.store.getState();
-    const requestId = crypto.randomUUID();
+    const { appContext, aiChat } = this.store.getState();
+    const requestId = newId();
     const createdAt = new Date().toISOString();
-    const user = state.appContext.user;
     const payload = {
       requestId,
-      sessionId: state.aiChat.sessionId,
-      user_role: state.appContext.userRole,
+      sessionId: aiChat.sessionId,
+      user_role: appContext.userRole,
       user_mode: "student",
       mode_name: "ai-interviewer",
       source: "interview-voice-stream",
@@ -203,35 +204,28 @@ class AIRequestHandler {
       sampleRate,
       language: "en-IN",
       questionNumber,
-      user: user ? {
-        id: user._id || user.id || null,
-        name: user.name || null,
-        email: user.email || null,
-        role: state.appContext.userRole,
-        branch: user.branch || null,
-        skills: Array.isArray(user.skills) ? user.skills : [],
-      } : null,
+      user: userSummary(appContext.user, appContext.userRole),
       details: {
-        ...state.appContext.details,
-        selected_job: state.aiChat.journey.selectedJob,
-        resume: state.aiChat.journey.resume,
+        ...appContext.details,
+        selected_job: aiChat.journey.selectedJob,
+        resume: aiChat.journey.resume,
         input_type: "voice",
         speech_language: "en-IN",
+        ui_context: uiContextFor(appContext),
       },
-      past_messages: state.aiChat.messages.slice(-8).map((message) => ({
-        role: message.sender === "user" ? "user" : "assistant",
-        content: message.text || "",
-      })),
+      past_messages: pastMessages(aiChat.messages),
     };
 
-    this.store.dispatch(requestStarted({
-      requestId,
-      userMessageId: crypto.randomUUID(),
-      assistantMessageId: crypto.randomUUID(),
-      text: "🎙️ Listening…",
-      createdAt,
-      payload,
-    }));
+    this.store.dispatch(
+      requestStarted({
+        requestId,
+        userMessageId: newId(),
+        assistantMessageId: newId(),
+        text: "🎙️ Listening…",
+        createdAt,
+        payload,
+      }),
+    );
     this.store.dispatch(setAgentMode("ai-interviewer"));
     ensureSocketAuthentication();
     socket.emit("interview:audio:start", payload, (result) => onAcknowledged?.(result));
@@ -246,6 +240,7 @@ class AIRequestHandler {
     if (requestId) socket.emit("interview:audio:cancel", { requestId });
   }
 
+  /** Tile/button AI features: role-checked panel open + default prompt (deduped while running). */
   runFeature(featureId) {
     if (!this.store) throw new Error("AI request handler has not been initialized");
 
@@ -253,17 +248,17 @@ class AIRequestHandler {
     if (!feature) return null;
 
     const state = this.store.getState();
-    const activeRequest = Object.values(state.aiChat.requests).find((request) =>
-      request.feature === feature.id &&
-      (request.status === "pending" || request.status === "streaming")
+    const role = state.appContext.userRole;
+    const targetMode = resolveTarget(feature.panel, role, feature.params ?? {})?.mode;
+    if (!feature.roles.includes(role) || !targetMode || !isModeAllowed(role, targetMode)) {
+      toastError("Not available for your role");
+      return null;
+    }
+    applyUiActions([{ panel: feature.panel, params: feature.params }], { source: "user" });
+
+    const activeRequest = Object.values(state.aiChat.requests).find(
+      (request) => request.feature === feature.id && (request.status === "pending" || request.status === "streaming"),
     );
-
-    this.store.dispatch(setUserMode(feature.userMode));
-    this.store.dispatch(setActiveFeature(feature.uiFeature));
-    if (feature.uiTab) this.store.dispatch(setActiveJobsTab(feature.uiTab));
-    if (feature.uiTool) this.store.dispatch(setActiveResumeTool(feature.uiTool));
-    localStorage.setItem("activeMode", feature.userMode);
-
     if (activeRequest) return { requestId: activeRequest.requestId, sessionId: state.aiChat.sessionId };
 
     return this.send({
@@ -276,94 +271,52 @@ class AIRequestHandler {
 
   handleResponse(payload) {
     if (!payload?.requestId || !this.store) return;
+    const { dispatch } = this.store;
     const request = this.store.getState().aiChat.requests[payload.requestId];
     if (!request || request.status === "failed") return;
 
-    this.store.dispatch(responseReceived(payload));
-    const routedAgentMode = AGENT_MODE_BY_HEADER[payload.header_message];
-    if (routedAgentMode) this.store.dispatch(setAgentMode(routedAgentMode));
-    if (
-      payload.header_message === "mode:jobparser:jobslist" &&
-      Array.isArray(payload.data) &&
-      payload.data.length > 0
-    ) {
-      this.store.dispatch(setUserMode("student"));
-      this.store.dispatch(setActiveFeature("drives"));
-      this.store.dispatch(setActiveJobsTab("matched"));
-      localStorage.setItem("activeMode", "student");
+    // 1–2. Message + workspaces.
+    dispatch(responseReceived(payload));
+
+    // 3. Sticky agent mode.
+    const header = payload.header_message;
+    const routedAgentMode = agentModeForHeader(header);
+    if (routedAgentMode) dispatch(setAgentMode(routedAgentMode));
+
+    // 4. UI actions (role-checked; deduped per request).
+    if (isCopilotHeader(header)) {
+      const actions = copilotUiActions(payload);
+      if (actions.length) applyUiActions(actions, { source: "copilot", requestId: payload.requestId });
+    } else {
+      const actions = routeHeader(payload);
+      if (actions.length) applyUiActions(actions, { source: "header", requestId: payload.requestId });
     }
-    if (payload.header_message === "mode:jobparser:eligibility") {
-      this.store.dispatch(setUserMode("student"));
-      this.store.dispatch(setActiveFeature("drives"));
-      this.store.dispatch(setActiveJobsTab("available"));
-      localStorage.setItem("activeMode", "student");
+
+    // 5. Terminal failures release every busy workspace.
+    if (payload.isEnd && (isFailureHeader(header) || payload.data?.type === "error")) {
+      dispatch(
+        requestFailed({
+          requestId: payload.requestId,
+          message: payload.response || payload.data?.message || FALLBACK_ERROR_TEXT,
+          header,
+        }),
+      );
+      if (header === "auth:required") dispatch(bootstrapSession());
     }
-    if (payload.header_message === "resume_generator" || payload.header_message === "resume-generator") {
-      this.store.dispatch(setUserMode("resume"));
-      const analysisTool = payload.data?.type === "analysis"
-        ? payload.data.analysis_type === "gap" ? "skill-gap" : "ats"
-        : "generator";
-      this.store.dispatch(setActiveResumeTool(analysisTool));
-      localStorage.setItem("activeMode", "resume");
+
+    // 6. Wishlist / tracker result.
+    if (header === "mode:jobparser:addjob:wishlist" && payload.data?.type === "wishlist") {
+      if (payload.data.ok) toastSuccess(payload.response || "Saved to your job tracker");
+      else toastError(payload.response || "Couldn't update your job tracker");
     }
-    if (payload.header_message?.startsWith("mode:jobCreation:")) {
-      this.store.dispatch(setUserMode("tpo"));
-      this.store.dispatch(setActiveFeature("job-creator"));
-      localStorage.setItem("activeMode", "tpo");
-    }
-    if (
-      payload.header_message === "mode:switch:pr-outreach" ||
-      payload.header_message === "mail:review" ||
-      payload.header_message === "pr_outreach_satisfied"
-    ) {
-      this.store.dispatch(setUserMode("pr_outreach"));
-      localStorage.setItem("activeMode", "pr_outreach");
-    }
-    if (
-      payload.header_message === "mode:switch:alumni-connect" ||
-      payload.header_message === "alumni:matches" ||
-      payload.header_message === "alumni:request-review"
-      || payload.header_message === "alumni:resume-share-review"
-    ) {
-      this.store.dispatch(setUserMode("alumni_connect"));
-      localStorage.setItem("activeMode", "alumni_connect");
-    }
-    if (
-      payload.header_message === "mode:switch:ai-interviewer" ||
-      payload.header_message === "button:options" ||
-      payload.header_message === "select:job:db" ||
-      payload.header_message === "text:mode:interview" ||
-      payload.header_message === "interview:end"
-    ) {
-      this.store.dispatch(setUserMode("student"));
-      this.store.dispatch(setActiveFeature("mock-interview"));
-      localStorage.setItem("activeMode", "student");
-    }
-    if (
-      payload.header_message === "mode:switch:gap-analysis" ||
-      payload.header_message === "mode:gapAnalysis:analysis" ||
-      payload.header_message === "mode:gapAnalysis:suggestions" ||
-      payload.header_message === "mode:gapAnalysis:error"
-    ) {
-      this.store.dispatch(setUserMode("tpo"));
-      this.store.dispatch(setActiveFeature("gap-analysis"));
-      localStorage.setItem("activeMode", "tpo");
-    }
-    if (
-      payload.header_message === "mode:switch:learning-recommendation" ||
-      payload.header_message === "select:interview:db" ||
-      payload.header_message === "learning:recommendations" ||
-      payload.header_message === "learning:recommendations-error"
-    ) {
-      this.store.dispatch(setUserMode("student"));
-      this.store.dispatch(setActiveFeature("learning-recommendation"));
-      localStorage.setItem("activeMode", "student");
-    }
+
+    // 7. Inactivity timer.
     if (payload.isEnd) this.clearTimeout(payload.requestId);
     else this.armTimeout(payload.requestId);
   }
 
   armTimeout(requestId) {
+    if (!requestId) return;
     this.clearTimeout(requestId);
     const timeout = setTimeout(() => {
       this.timeouts.delete(requestId);
@@ -386,16 +339,17 @@ class AIRequestHandler {
   startNewChat(name) {
     if (!this.store) return;
     this.clearAllTimeouts();
+    const user = this.store.getState().appContext.user;
     this.store.dispatch(setAgentMode(null));
     this.store.dispatch(setActiveJobsTab("matched"));
-    this.store.dispatch(newChatStarted(name));
+    this.store.dispatch(newChatStarted({ name: name || user?.name, role: user?.role }));
   }
 
   openConversation(sessionId) {
     if (!this.store) return;
     this.clearAllTimeouts();
-    this.store.dispatch(setAgentMode(null));
     this.store.dispatch(conversationOpened(sessionId));
+    this.store.dispatch(setAgentMode(agentModeForMessages(this.store.getState().aiChat.messages)));
   }
 }
 

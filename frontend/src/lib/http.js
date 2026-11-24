@@ -13,7 +13,7 @@
 // cookie token over the Authorization header, so a stale cookie would
 // otherwise shadow a fresh header token.
 import axios from "axios";
-import { API_BASE } from "./api";
+import { API_BASE } from "./config.js";
 
 export class ApiClientError extends Error {
   constructor({ status = 0, code = "NETWORK", message = "Request failed", details = null } = {}) {

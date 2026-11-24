@@ -1,153 +1,94 @@
-import { useState, useRef, useEffect } from "react";
-import { GraduationCap, Building2, ShieldCheck, ChevronDown, Check, Files, Mail, Users } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Check, ChevronDown } from "lucide-react";
+import { MODE_DEFS, allowedModesFor } from "../workspace/modes.js";
+import ModeIcon from "../workspace/ModeIcon.jsx";
 
-const MODES = [
-  {
-    id: "student",
-    label: "Student Mode",
-    badge: "IPU @ipu.ac.in",
-    icon: GraduationCap,
-    description: "Career profile, skills, projects, experience & job matching"
-  },
-  {
-    id: "alumni_connect",
-    label: "Alumni Connect",
-    badge: "Student Mentorship",
-    icon: Users,
-    description: "Find alumni mentors and manage connection requests"
-  },
-  {
-    id: "alumni",
-    label: "Alumni Portal",
-    badge: "Mentor Workspace",
-    icon: Users,
-    description: "Onboard, review requests and mentor students"
-  },
-  {
-    id: "resume",
-    label: "Resume Studio",
-    badge: "Student Workspace",
-    icon: Files,
-    description: "Generate, upload, manage and score resume versions"
-  },
-  {
-    id: "pr_outreach",
-    label: "PR & Outreach",
-    badge: "AI Mail Workspace",
-    icon: Mail,
-    description: "Draft and review professional outreach with the AI agent"
-  },
-  {
-    id: "company",
-    label: "Company / Recruiter Mode",
-    badge: "Verified Domain",
-    icon: Building2,
-    description: "Post placement drives & manage student applicants"
-  },
-  {
-    id: "tpo",
-    label: "College TPO Mode",
-    badge: "Super Admin",
-    icon: ShieldCheck,
-    description: "TPO oversight, analytics & campus drive management"
-  }
-];
-
+/** Mode selector limited to the role's modes (FRONTEND.md §4.2). One mode → a static box. */
 export default function ModeDropdown({ activeMode, setActiveMode, userRole = "student" }) {
   const [isOpen, setIsOpen] = useState(false);
-  const dropdownRef = useRef(null);
+  const containerRef = useRef(null);
+  const modes = allowedModesFor(userRole).map((id) => MODE_DEFS[id]).filter(Boolean);
+  const current = modes.find((mode) => mode.id === activeMode) ?? modes[0];
+  const single = modes.length <= 1;
 
-  const allowedByRole = {
-    student: ["student", "resume", "pr_outreach", "alumni_connect"],
-    tpo: ["tpo", "pr_outreach"],
-    admin: ["tpo", "pr_outreach"],
-    company: ["company"],
-    alumni: ["alumni"],
-  };
-  const visibleModes = MODES.filter((mode) => (allowedByRole[userRole] || ["student"]).includes(mode.id));
-  const currentMode = visibleModes.find((m) => m.id === activeMode) || visibleModes[0] || MODES[0];
-  const CurrentIcon = currentMode.icon;
-
-  // Close dropdown on outside click
   useEffect(() => {
-    const handleClickOutside = (e) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
-        setIsOpen(false);
-      }
+    if (!isOpen) return undefined;
+    const onPointerDown = (event) => {
+      if (containerRef.current && !containerRef.current.contains(event.target)) setIsOpen(false);
     };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") setIsOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("touchstart", onPointerDown, { passive: true });
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("touchstart", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isOpen]);
+
+  const summary = (
+    <span className="flex min-w-0 items-center gap-2.5">
+      <span className="shrink-0 bg-black p-1 text-white">
+        <ModeIcon name={current?.icon} className="h-3.5 w-3.5" />
+      </span>
+      <span className="min-w-0 text-left">
+        <span className="block text-[10px] font-extrabold uppercase leading-none tracking-wider text-gray-500">Current mode</span>
+        <span className="mt-0.5 block truncate text-xs font-black uppercase text-black">{current?.label ?? "Workspace"}</span>
+      </span>
+    </span>
+  );
+
+  if (single) {
+    return <div className="flex w-full items-center justify-between gap-2.5 border border-gray-900 bg-white px-3.5 py-1.5 sm:w-72">{summary}</div>;
+  }
 
   return (
-    <div className="relative" ref={dropdownRef}>
-      {/* Trigger Button with space-between layout */}
+    <div className="relative w-full sm:w-72" ref={containerRef}>
       <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-72 flex items-center justify-between gap-2.5 bg-white border border-gray-900 px-3.5 py-1.5 rounded-none hover:bg-gray-50 focus:outline-none transition-colors cursor-pointer"
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={isOpen}
+        onClick={() => setIsOpen((open) => !open)}
+        className="flex min-h-11 w-full items-center justify-between gap-2.5 border border-gray-900 bg-white px-3.5 py-1.5 transition-colors hover:bg-gray-50 sm:min-h-0"
       >
-        <div className="flex items-center gap-2.5">
-          <div className="p-1 bg-black text-white rounded-none">
-            <CurrentIcon className="w-3.5 h-3.5" />
-          </div>
-          <div className="text-left">
-            <div className="text-[10px] font-extrabold uppercase tracking-wider text-gray-500 leading-none">
-              CURRENT MODE
-            </div>
-            <div className="text-xs font-black uppercase text-black mt-0.5">
-              <span>{currentMode.label}</span>
-            </div>
-          </div>
-        </div>
-
-        <ChevronDown
-          className={`w-4 h-4 text-black transition-transform duration-200 ${isOpen ? "rotate-180" : ""
-            }`}
-        />
+        {summary}
+        <ChevronDown className={`h-4 w-4 shrink-0 transition-transform duration-200 ${isOpen ? "rotate-180" : ""}`} aria-hidden="true" />
       </button>
 
-      {/* Popover Dropdown Menu */}
       {isOpen && (
-        <div className="absolute right-0 sm:left-0 mt-1.5 w-72 bg-white border-2 border-black z-50 py-0 rounded-none divide-y divide-gray-100 shadow-md">
-          {visibleModes.map((mode) => {
-            const Icon = mode.icon;
-            const isSelected = activeMode === mode.id;
-
+        <ul role="listbox" aria-label="Workspace mode" className="absolute left-0 right-0 z-50 mt-1.5 divide-y divide-gray-100 border-2 border-black bg-white shadow-md">
+          {modes.map((mode) => {
+            const selected = mode.id === current?.id;
             return (
-              <button
-                key={mode.id}
-                onClick={() => {
-                  setActiveMode(mode.id);
-                  setIsOpen(false);
-                }}
-                className={`w-full text-left px-3 py-2.5 flex items-start gap-2.5 transition-colors cursor-pointer ${isSelected ? "bg-black text-white" : "hover:bg-gray-100 text-black"
-                  }`}
-              >
-                <div
-                  className={`p-1.5 rounded-none mt-0.5 ${isSelected ? "bg-white text-black" : "bg-black text-white"
-                    }`}
+              <li key={mode.id} role="option" aria-selected={selected}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsOpen(false);
+                    if (!selected) setActiveMode(mode.id);
+                  }}
+                  className={`flex w-full items-start gap-2.5 px-3 py-2.5 text-left transition-colors ${selected ? "bg-black text-white" : "text-black hover:bg-gray-100"}`}
                 >
-                  <Icon className="w-3.5 h-3.5" />
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="text-xs font-black uppercase tracking-tight truncate">
-                      {mode.label}
+                  <span className={`mt-0.5 p-1.5 ${selected ? "bg-white text-black" : "bg-black text-white"}`}>
+                    <ModeIcon name={mode.icon} className="h-3.5 w-3.5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center justify-between gap-1">
+                      <span className="truncate text-xs font-black uppercase tracking-tight">{mode.label}</span>
+                      {selected && <Check className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
                     </span>
-                    {isSelected && <Check className="w-3.5 h-3.5 text-white flex-shrink-0" />}
-                  </div>
-                  <p
-                    className={`text-[11px] font-medium leading-tight mt-0.5 line-clamp-1 ${isSelected ? "text-gray-300" : "text-gray-600"
-                      }`}
-                  >
-                    {mode.description}
-                  </p>
-                </div>
-              </button>
+                    <span className={`mt-0.5 line-clamp-1 block text-[11px] font-medium leading-tight ${selected ? "text-gray-300" : "text-gray-600"}`}>
+                      {mode.description}
+                    </span>
+                  </span>
+                </button>
+              </li>
             );
           })}
-        </div>
+        </ul>
       )}
     </div>
   );

@@ -7,7 +7,7 @@
 // The socket re-authenticates whenever the access token changes
 // (login, refresh), so components never manage auth themselves.
 import { useEffect, useRef, useState } from "react";
-import { ensureSocketAuthentication, socket } from "./socket";
+import { ensureSocketAuthentication, socket } from "./socket.js";
 
 /** Subscribe to a socket event for the lifetime of the component. */
 export function useSocketEvent(event, handler) {
