@@ -22,6 +22,12 @@ const ELIGIBILITY_CONTRACT = {
 
 export const buildRequestMetadata = async ({ modeName, user, effectiveRole, details }) => {
     const normalizedMode = String(modeName || "").trim().toLowerCase().replaceAll("_", "-");
+    if (normalizedMode === "copilot") {
+        // The copilot fetches everything else through agent tools on demand.
+        const profile = buildProfile(user, details);
+        const institution = await getInstitutionContext(user, effectiveRole);
+        return { profile, ...institution };
+    }
     if (normalizedMode === "learning-recommendation") {
         const profile = buildProfile(user, details);
         const institution = await getInstitutionContext(user, effectiveRole);

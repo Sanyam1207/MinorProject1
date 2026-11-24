@@ -8,6 +8,12 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ limit: "1mb", extended: true }));
 app.use(cookieParser());
+// Express 5 leaves req.body undefined when a request has no body; handlers
+// across the codebase destructure it, so default it to an empty object.
+app.use((req, _res, next) => {
+    if (req.body === undefined) req.body = {};
+    next();
+});
 app.use(cors({
     // CORS env: comma-separated allow-list; "*"/unset reflects any origin (local dev only).
     origin: CORS_ORIGINS,

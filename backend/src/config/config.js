@@ -53,3 +53,5 @@ export const AGENT_TOOL_TOKEN_TTL = process.env.AGENT_TOOL_TOKEN_TTL || "15m"
 export const CORS_ORIGINS = !CORS || CORS.trim() === "*"
     ? true
     : CORS.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean)
+// Shared secret Node presents to the Python agent service (socket.io auth).
+export const AI_SERVICE_TOKEN = process.env.AI_SERVICE_TOKEN || ""
