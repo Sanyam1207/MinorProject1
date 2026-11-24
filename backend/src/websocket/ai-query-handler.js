@@ -38,7 +38,7 @@ const buildAgentContext = ({ user, effectiveRole, requestId, sessionId }) => {
     };
     if (user && AGENT_TOOL_SECRET) {
         context.tool_token = jwt.sign(
-            { sub: user._id.toString(), role: user.role, rid: requestId, sid: sessionId, typ: "agent-tool" },
+            { sub: user._id.toString(), role: user.role, rid: requestId, sid: sessionId, typ: "agent-tool", tv: user.tokenVersion || 0 },
             AGENT_TOOL_SECRET,
             { expiresIn: AGENT_TOOL_TOKEN_TTL },
         );
