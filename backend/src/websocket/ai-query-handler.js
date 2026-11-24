@@ -1,5 +1,12 @@
 import { io as ioClient } from "socket.io-client";
-import { AI_SERVICE_URL } from "../config/config.js";
+import jwt from "jsonwebtoken";
+import {
+    AI_SERVICE_URL,
+    AGENT_TOOL_SECRET,
+    AGENT_TOOL_TOKEN_TTL,
+    APP_TIMEZONE,
+    INTERNAL_API_URL,
+} from "../config/config.js";
 import { getAuthenticatedUser, getEffectiveRole } from "./auth-context.js";
 import { buildRequestMetadata } from "./metadata-builder.js";
 import { persistConfirmedJob } from "./job-service.js";
@@ -8,6 +15,30 @@ import { recordAlumniRequestReview } from "../utils/alumni-review-session.js";
 import { recordResumeShareReview } from "../utils/resume-share-review-session.js";
 import { resolveIntentMode } from "./intent-router.js";
 import { saveCompletedInterview, saveInterviewRecommendations } from "../services/interview.service.js";
+
+// Identity + short-lived credential the Python copilot uses to call
+// /api/v1/agent-tools as this user (docs/contracts/AGENT-TOOLS.md §1).
+const buildAgentContext = ({ user, effectiveRole, requestId, sessionId }) => {
+    const context = {
+        actor: user ? {
+            user_id: user._id.toString(),
+            role: user.role === "admin" ? "admin" : effectiveRole,
+            name: user.name || "",
+            email: user.email || "",
+        } : null,
+        tools_url: `${INTERNAL_API_URL}/api/v1/agent-tools`,
+        now: new Date().toISOString(),
+        timezone: APP_TIMEZONE,
+    };
+    if (user && AGENT_TOOL_SECRET) {
+        context.tool_token = jwt.sign(
+            { sub: user._id.toString(), role: user.role, rid: requestId, sid: sessionId, typ: "agent-tool" },
+            AGENT_TOOL_SECRET,
+            { expiresIn: AGENT_TOOL_TOKEN_TTL },
+        );
+    }
+    return context;
+};
 
 const emitUnavailable = (io, requestId, closeConnection) => {
     io.to(requestId).emit("response", {
@@ -102,7 +133,10 @@ export const createAIQueryHandler = (io, { onAgentResponse } = {}) => async func
     const user = await getAuthenticatedUser(this);
     const effectiveRole = getEffectiveRole(user, user_role);
     const resolvedModeName = resolveIntentMode({ query: user_query, modeName: mode_name });
-    const meta_data = await buildRequestMetadata({ modeName: resolvedModeName, user, effectiveRole, details });
+    const meta_data = {
+        ...(await buildRequestMetadata({ modeName: resolvedModeName, user, effectiveRole, details })),
+        ...buildAgentContext({ user, effectiveRole, requestId, sessionId }),
+    };
     const aiConnection = ioClient(AI_SERVICE_URL, {
         transports: ["websocket", "polling"],
         reconnection: false,

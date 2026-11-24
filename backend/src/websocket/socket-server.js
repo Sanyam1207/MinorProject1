@@ -1,20 +1,37 @@
 import { Server } from "socket.io";
-import { CORS } from "../config/config.js";
+import { CORS_ORIGINS } from "../config/config.js";
 import { createAIQueryHandler } from "./ai-query-handler.js";
 import { createInterviewSpeechController } from "./interview-speech.js";
-
-// Reflect arbitrary origins only in local/demo configuration. A configured
-// comma-separated allow-list remains exact and supports credentialed sockets.
-const corsOrigin = !CORS || CORS === "*"
-    ? true
-    : CORS.split(",").map((origin) => origin.trim()).filter(Boolean);
+import { getAuthenticatedUser } from "./auth-context.js";
+import { rooms, setIO } from "../core/realtime.js";
+import { registerModuleSockets } from "../modules/index.js";
 
 export const attachSocketServer = (server) => {
     const io = new Server(server, {
-        cors: { origin: corsOrigin, credentials: true },
+        // CORS env: exact allow-list when configured; reflect any origin only in local/demo setups.
+        cors: { origin: CORS_ORIGINS, credentials: true },
+    });
+    setIO(io);
+
+    // Resolve the user once per connection, before any event handler runs, so
+    // early client events (e.g. attendance:presenter:join) are never dropped.
+    // Anonymous sockets are allowed; handlers decide what they may do.
+    io.use(async (socket, next) => {
+        try {
+            socket.data.user = await getAuthenticatedUser(socket);
+        } catch {
+            socket.data.user = null;
+        }
+        next();
     });
 
     io.on("connection", (socket) => {
+        const user = socket.data.user;
+        if (user?._id) {
+            socket.join(rooms.user(user._id));
+            if (user.role) socket.join(rooms.role(user.role));
+        }
+
         let queryHandler;
         const interviewSpeech = createInterviewSpeechController({
             socket,
@@ -30,6 +47,9 @@ export const attachSocketServer = (server) => {
         socket.on("interview:audio:end", interviewSpeech.end);
         socket.on("interview:audio:cancel", interviewSpeech.cancel);
         socket.on("disconnect", interviewSpeech.dispose);
+
+        // Feature modules (notifications, attendance presenter rooms, ...).
+        registerModuleSockets(io, socket, { user });
     });
 
     console.log("Socket.io running on /socket.io");

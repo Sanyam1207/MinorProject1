@@ -39,3 +39,17 @@ export const INTERVIEW_SPEECH_THREADS = Math.max(1, Number(process.env.INTERVIEW
 export const INTERVIEW_ANSWER_SECONDS = Math.max(10, Math.min(300, Number(process.env.INTERVIEW_ANSWER_SECONDS) || 60))
 export const INTERVIEW_SILENCE_SECONDS = Math.max(2, Math.min(15, Number(process.env.INTERVIEW_SILENCE_SECONDS) || 4))
 export const INTERVIEW_SPEECH_RMS_THRESHOLD = Math.max(0.001, Math.min(0.2, Number(process.env.INTERVIEW_SPEECH_RMS_THRESHOLD) || 0.012))
+
+// ── Integration (Minor Project) ─────────────────────────────────────────────
+export const APP_NAME = (process.env.APP_NAME || "Matchy Campus").trim()
+// College time zone: timetables, "tomorrow 10am" parsing, working hours.
+export const APP_TIMEZONE = (process.env.APP_TIMEZONE || "Asia/Kolkata").trim()
+// How the Python agent service reaches this backend's tool endpoints.
+export const INTERNAL_API_URL = (process.env.INTERNAL_API_URL || `http://127.0.0.1:${process.env.PORT || 8000}`).replace(/\/$/, "")
+// Signs the short-lived tokens the copilot uses to call /api/v1/agent-tools.
+export const AGENT_TOOL_SECRET = process.env.AGENT_TOOL_SECRET || ""
+export const AGENT_TOOL_TOKEN_TTL = process.env.AGENT_TOOL_TOKEN_TTL || "15m"
+// Comma-separated origins allowed by CORS/socket.io ("*" or empty = reflect any origin, dev only).
+export const CORS_ORIGINS = !CORS || CORS.trim() === "*"
+    ? true
+    : CORS.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean)

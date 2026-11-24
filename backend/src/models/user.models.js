@@ -18,7 +18,7 @@ const UserSchema = new Schema({
     },
     role: {
         type: String,
-        enum: ["student", "tpo", "company", "admin", "alumni"],
+        enum: ["student", "teacher", "tpo", "company", "admin", "alumni"],
         default: "student",
     },
     profile: {
@@ -172,11 +172,57 @@ const UserSchema = new Schema({
             portfolio: "",
         }
     },
+    // ── Academic placement used by attendance auto-enrolment ──
+    rollNumber: { type: String, trim: true },
+    section: { type: String, trim: true, uppercase: true },
+    semester: { type: Number, min: 1, max: 12 },
+    // ── Faculty (role "teacher") ──
+    department: { type: String, trim: true },
+    designation: { type: String, trim: true },
+    employeeId: { type: String, trim: true },
+    isActive: { type: Boolean, default: true },
+    // ── Notifications (see docs/contracts/NOTIFICATIONS.md) ──
+    notificationPreferences: {
+        email: { type: Boolean, default: false },
+        push: { type: Boolean, default: true },
+        mutedTypes: { type: [String], default: [] },
+    },
+    // ── Bring-your-own LLM keys (ported from Matchy). Encrypted at rest and
+    //    excluded from queries unless explicitly selected with "+llmCredentials". ──
+    llmCredentials: {
+        type: [{
+            label: { type: String, trim: true, maxlength: 80 },
+            provider: { type: String, enum: ["openai", "anthropic", "google", "xai"], required: true },
+            encryptedApiKey: { type: String, required: true },
+            model: { type: String, trim: true },
+            updatedAt: { type: Date, default: Date.now },
+        }],
+        default: [],
+        select: false,
+    },
 
 },
     {
         timestamps: true
     })
+
+const SENSITIVE_USER_FIELDS = [
+    "password",
+    "refreshToken",
+    "passwordResetToken",
+    "passwordResetExpiry",
+    "gmailRefreshTokenEncrypted",
+    "llmCredentials",
+];
+
+const stripSensitiveFields = (_doc, ret) => {
+    for (const field of SENSITIVE_USER_FIELDS) delete ret[field];
+    return ret;
+};
+
+UserSchema.set("toJSON", { transform: stripSensitiveFields });
+
+UserSchema.index({ role: 1, branch: 1, passingYear: 1, section: 1 });
 
 UserSchema.pre("save", async function () {
     if (!this.isModified("password")) return;
