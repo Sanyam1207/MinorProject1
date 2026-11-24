@@ -1,7 +1,8 @@
 import { io } from "socket.io-client";
-import { API_BASE } from "./api";
+import { API_ORIGIN } from "./api";
 
-const SOCKET_URL = new URL(API_BASE).origin;
+// Same origin as the app unless VITE_API_BASE_URL points at a separate API host.
+const SOCKET_URL = API_ORIGIN || window.location.origin;
 
 export const socket = io(SOCKET_URL, {
   autoConnect: true,

@@ -1,6 +1,8 @@
 import axios from "axios";
 
-const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
+// Empty VITE_API_BASE_URL = same origin: the Vite dev proxy (see vite.config.js)
+// or a production reverse proxy serving /api and /socket.io next to the app.
+export const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 export const API_BASE = `${API_ORIGIN}/api/v1`;
 
 const getAuthHeader = () => {

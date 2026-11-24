@@ -168,7 +168,7 @@ export const createAIQueryHandler = (_io, { onAgentResponse } = {}) => async fun
     // The regex intent router only chooses the mode for a turn that has none.
     // Inside an active workflow the Python orchestrator decides (stricter
     // switch rules + agent hooks), so Node never hijacks e.g. interview answers.
-    const suggestedMode = resolveIntentMode({ query, modeName: requestedMode });
+    const suggestedMode = resolveIntentMode({ query, modeName: requestedMode, role: user.role === "admin" ? "admin" : effectiveRole });
     const forwardedMode = requestedMode || suggestedMode || null;
 
     let meta_data;
