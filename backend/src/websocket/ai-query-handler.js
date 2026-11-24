@@ -46,6 +46,22 @@ const buildAgentContext = ({ user, effectiveRole, requestId, sessionId }) => {
     return context;
 };
 
+// What the user is looking at in the right-hand workspace, so the copilot can
+// resolve "this course" / "this job" (PYTHON.md §9). Only small id-like params.
+const sanitizeUiContext = (value) => {
+    if (!value || typeof value !== "object") return undefined;
+    const panel = typeof value.panel === "string" ? value.panel.slice(0, 64) : null;
+    const mode = typeof value.mode === "string" ? value.mode.slice(0, 32) : null;
+    const params = {};
+    if (value.params && typeof value.params === "object") {
+        for (const [key, raw] of Object.entries(value.params).slice(0, 20)) {
+            if (typeof raw === "string" && raw.length <= 200) params[key.slice(0, 40)] = raw;
+            else if (typeof raw === "number" || typeof raw === "boolean") params[key.slice(0, 40)] = raw;
+        }
+    }
+    return panel || mode ? { panel, mode, params } : undefined;
+};
+
 const terminalChunk = (requestId, header_message, response, data = { type: "error" }) => ({
     requestId,
     header_message,
@@ -58,7 +74,7 @@ const persistJobCreationResponse = async ({ payload, user, sessionId }) => {
     if (payload.header_message !== "mode:jobCreation:post" || !payload.data?.job) return payload;
 
     try {
-        const persistedJob = await persistConfirmedJob({ job: payload.data.job, user, sessionId });
+        const persistedJob = await persistConfirmedJob({ job: payload.data.job, user, sessionId, draftId: payload.data?.draft_id });
         return {
             ...payload,
             data: { ...payload.data, persisted_job_id: persistedJob._id.toString() },
@@ -184,6 +200,11 @@ export const createAIQueryHandler = (_io, { onAgentResponse } = {}) => async fun
             ...base,
             ...buildAgentContext({ user, effectiveRole, requestId, sessionId }),
         };
+        const uiContext = sanitizeUiContext(details?.ui_context);
+        if (uiContext) meta_data.ui_context = uiContext;
+        if (!meta_data.selected_job && details?.selected_job && typeof details.selected_job === "object") {
+            meta_data.selected_job = details.selected_job;
+        }
     } catch (error) {
         console.error("Unable to build agent metadata:", error);
         emit(terminalChunk(requestId, "error", "I could not load your data right now. Please try again in a moment."));

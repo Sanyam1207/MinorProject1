@@ -55,3 +55,14 @@ export const CORS_ORIGINS = !CORS || CORS.trim() === "*"
     : CORS.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean)
 // Shared secret Node presents to the Python agent service (socket.io auth).
 export const AI_SERVICE_TOKEN = process.env.AI_SERVICE_TOKEN || ""
+
+// ── Identity (docs/contracts/AUTH-FACULTY.md §13) ───────────────────────────
+export const TEACHER_EMAILS = new Set(
+    (process.env.TEACHER_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean),
+)
+export const GOOGLE_REQUIRE_HOSTED_DOMAIN = String(process.env.GOOGLE_REQUIRE_HOSTED_DOMAIN || "false").toLowerCase() === "true"
+export const AUTH_COOKIE_SAMESITE = ["strict", "lax", "none"].includes(String(process.env.AUTH_COOKIE_SAMESITE || "").toLowerCase())
+    ? String(process.env.AUTH_COOKIE_SAMESITE).toLowerCase()
+    : "strict"
+export const PASSWORD_RESET_TTL_MINUTES = Math.max(5, Number(process.env.PASSWORD_RESET_TTL_MINUTES) || 30)
+export const TEMP_PASSWORD_TTL_DAYS = Math.max(1, Number(process.env.TEMP_PASSWORD_TTL_DAYS) || 7)

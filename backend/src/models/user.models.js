@@ -176,6 +176,10 @@ const UserSchema = new Schema({
     rollNumber: { type: String, trim: true },
     section: { type: String, trim: true, uppercase: true },
     semester: { type: Number, min: 1, max: 12 },
+    // ── Trusted academic record used by placement eligibility (PLACEMENTS §3.7) ──
+    activeBacklogs: { type: Number, min: 0, max: 50 },
+    tenthPercentage: { type: Number, min: 0, max: 100 },
+    twelfthPercentage: { type: Number, min: 0, max: 100 },
     // ── Faculty (role "teacher") ──
     department: { type: String, trim: true },
     designation: { type: String, trim: true },
@@ -195,6 +199,8 @@ const UserSchema = new Schema({
             provider: { type: String, enum: ["openai", "anthropic", "google", "xai"], required: true },
             encryptedApiKey: { type: String, required: true },
             model: { type: String, trim: true },
+            // Last characters of the key, shown masked in the UI (RESUME-BYOK).
+            keyHint: { type: String, maxlength: 40 },
             updatedAt: { type: Date, default: Date.now },
         }],
         default: [],
