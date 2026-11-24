@@ -6,6 +6,7 @@ import DBConnect from "./db/db.js"
 import { attachSocketServer } from "./websocket/socket-server.js"
 import { startModules } from "./modules/index.js"
 import { startScheduler, stopScheduler } from "./core/scheduler.js"
+import { flushDeliveries } from "./modules/notifications/notify.js"
 
 const port = PORT || 8000
 const server = http.createServer(app)
@@ -29,7 +30,9 @@ const shutdown = (signal) => {
     stopScheduler()
     io.close()
     server.close(() => {
-        mongoose.connection.close(false).finally(() => process.exit(0))
+        // Let in-flight push/email deliveries finish before the DB goes away.
+        Promise.resolve(flushDeliveries()).catch(() => {})
+            .finally(() => mongoose.connection.close(false).finally(() => process.exit(0)))
     })
     setTimeout(() => process.exit(0), 5000).unref()
 }
