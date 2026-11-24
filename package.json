@@ -1,0 +1,19 @@
+{
+  "name": "matchy-campus",
+  "private": true,
+  "version": "1.0.0",
+  "description": "AI-first campus placement portal with agentic chat, job feed, resume lab and QR attendance",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "install:all": "npm --prefix backend install && npm --prefix frontend install && cd ai-service && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
+    "test": "npm --prefix backend test && cd ai-service && .venv/bin/python -m pytest -q",
+    "test:backend": "npm --prefix backend test",
+    "test:ai": "cd ai-service && .venv/bin/python -m pytest -q",
+    "build": "npm --prefix frontend run build",
+    "seed:demo": "npm --prefix backend run seed:demo"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
