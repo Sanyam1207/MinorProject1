@@ -2,6 +2,7 @@ import mongoose, { Schema } from "mongoose";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import { PASSWORD_RESET_TTL_MINUTES } from "../config/config.js";
 
 const UserSchema = new Schema({
     name: {
@@ -51,9 +52,13 @@ const UserSchema = new Schema({
         required: false,
         select: false,
     },
+    // DEPRECATED: refresh tokens now live (hashed) in AuthSession
+    // (models/auth-session.models.js). Never written again; kept only so old
+    // documents still load. Never selected by default.
     refreshToken: {
         type: String,
         required: false,
+        select: false,
     },
     passwordResetToken: {
         type: String,
@@ -110,7 +115,7 @@ const UserSchema = new Schema({
     },
     TPO: {
         type: mongoose.Schema.Types.ObjectId,
-        ref: "Tpo",
+        ref: "TPO",
         required: false,
     },
     college: {
@@ -185,6 +190,20 @@ const UserSchema = new Schema({
     designation: { type: String, trim: true },
     employeeId: { type: String, trim: true },
     isActive: { type: Boolean, default: true },
+    // ── Identity and sessions (docs/contracts/AUTH-FACULTY.md §2.1) ──
+    // Copied into the access-token claim `tv`; incrementing it kills every
+    // access token of the user at once. Never selected by default (load it
+    // with "+tokenVersion" before generateAccessToken) and stripped from JSON.
+    tokenVersion: { type: Number, default: 0, select: false },
+    // Set by an invite or admin reset; the UI forces a password change.
+    mustChangePassword: { type: Boolean, default: false },
+    // Checked only while mustChangePassword is true.
+    tempPasswordExpiresAt: { type: Date },
+    invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    invitedAt: { type: Date },
+    lastLoginAt: { type: Date },
+    deactivatedAt: { type: Date },
+    deactivatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     // ── Notifications (see docs/contracts/NOTIFICATIONS.md) ──
     notificationPreferences: {
         email: { type: Boolean, default: false },
@@ -219,7 +238,17 @@ const SENSITIVE_USER_FIELDS = [
     "passwordResetExpiry",
     "gmailRefreshTokenEncrypted",
     "llmCredentials",
+    "tokenVersion",
 ];
+
+/**
+ * Projection for user reads whose result can reach a client. Required for
+ * `.lean()` reads, because the toJSON transform below does not run on them.
+ */
+export const USER_SAFE_PROJECTION = "-password -refreshToken -passwordResetToken -passwordResetExpiry";
+
+/** USER_SAFE_PROJECTION plus the (select:false) tokenVersion needed to verify or sign access tokens. */
+export const USER_AUTH_PROJECTION = `${USER_SAFE_PROJECTION} +tokenVersion`;
 
 const stripSensitiveFields = (_doc, ret) => {
     for (const field of SENSITIVE_USER_FIELDS) delete ret[field];
@@ -229,14 +258,26 @@ const stripSensitiveFields = (_doc, ret) => {
 UserSchema.set("toJSON", { transform: stripSensitiveFields });
 
 UserSchema.index({ role: 1, branch: 1, passingYear: 1, section: 1 });
+UserSchema.index({ college: 1, role: 1, isActive: 1 });
 
 UserSchema.pre("save", async function () {
     if (!this.isModified("password")) return;
+    // Google-only accounts have no password (an explicit undefined/null/"" clears it).
+    if (typeof this.password !== "string" || !this.password) {
+        this.password = undefined;
+        return;
+    }
     this.password = await bcrypt.hash(this.password, 10);
 })
 
+/** Never throws: false when there is no stored password or the input is not a string. */
 UserSchema.methods.isPasswordCorrect = async function (password) {
-    return await bcrypt.compare(password, this.password);
+    if (typeof password !== "string" || !password || typeof this.password !== "string" || !this.password) return false;
+    try {
+        return await bcrypt.compare(password, this.password);
+    } catch {
+        return false;
+    }
 }
 
 UserSchema.methods.generateAccessToken = function () {
@@ -246,30 +287,36 @@ UserSchema.methods.generateAccessToken = function () {
             email: this.email,
             name: this.name,
             role: this.role,
+            // tokenVersion is select:false: callers load it with "+tokenVersion"
+            // (new documents carry the default 0).
+            tv: this.tokenVersion ?? 0,
         },
         process.env.ACCESS_TOKEN_SECRET,
         {
-            expiresIn: process.env.ACCESS_TOKEN_EXPIRY,
+            expiresIn: process.env.ACCESS_TOKEN_EXPIRY || "1d",
         }
     )
 }
 
-UserSchema.methods.generateRefreshToken = function () {
+/** Refresh JWT bound to one AuthSession (`sid`); see services/auth-session.service.js. */
+UserSchema.methods.generateRefreshToken = function (sessionId) {
     return jwt.sign(
         {
             _id: this._id,
+            sid: sessionId ? String(sessionId) : undefined,
         },
         process.env.REFRESH_TOKEN_SECRET,
         {
-            expiresIn: process.env.REFRESH_TOKEN_EXPIRY,
+            expiresIn: process.env.REFRESH_TOKEN_EXPIRY || "10d",
         }
     )
 }
 
+/** Stores the sha256 of a fresh token and returns the raw token (never log it). */
 UserSchema.methods.generatePasswordResetToken = function () {
     const resetToken = crypto.randomBytes(32).toString("hex");
     this.passwordResetToken = crypto.createHash("sha256").update(resetToken).digest("hex");
-    this.passwordResetExpiry = Date.now() + 15 * 60 * 1000;
+    this.passwordResetExpiry = new Date(Date.now() + PASSWORD_RESET_TTL_MINUTES * 60 * 1000);
     return resetToken;
 }
 

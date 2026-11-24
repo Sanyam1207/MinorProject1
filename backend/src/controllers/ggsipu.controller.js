@@ -1,24 +1,27 @@
 import axios from "axios";
 import * as cheerio from "cheerio";
 import { createHash } from "node:crypto";
-import { User } from "../models/user.models.js";
+import { User, USER_SAFE_PROJECTION } from "../models/user.models.js";
 import { ApiError } from "../utils/api-error.js";
 import { Apiresponse } from "../utils/api-response.js";
 import asynchandler from "../utils/asynchandler.js";
-import { NODE_ENV } from "../config/config.js";
-import { generateAccessAndRefreshTokens, cookieOptions } from "./auth.controller.js";
+import { AUTH_COOKIE_SAMESITE, NODE_ENV } from "../config/config.js";
+import { College } from "../models/college.models.js";
+import { canonicalBranch } from "../utils/branch.js";
 import { findCollegeForEmail, linkStudentToCollege } from "../utils/student-college.js";
 
 const GGSIPU_BASE_URL = "https://examweb.ggsipu.ac.in";
 const SESSION_COOKIE = "ggsipu_session";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
+// Same SameSite/Secure policy as the auth cookies (AUTH-FACULTY §13, §15).
 const sessionCookieOptions = {
     httpOnly: true,
-    secure: NODE_ENV === "production",
-    sameSite: "strict",
+    secure: NODE_ENV === "production" || AUTH_COOKIE_SAMESITE === "none",
+    sameSite: AUTH_COOKIE_SAMESITE,
     path: "/api/v1/ggsipu",
 };
+const clearSessionCookie = (res) => res.clearCookie(SESSION_COOKIE, sessionCookieOptions);
 
 const hashPassword = (password, captcha) => {
     return createHash("sha256").update(password + captcha).digest("base64");
@@ -150,7 +153,7 @@ const loginAndFetchRecord = async (req, res, { enrollment, password, captcha }) 
     const loginSucceeded = loginRes.status === 302 && location.includes("studenthome");
 
     if (!loginSucceeded) {
-        res.clearCookie(SESSION_COOKIE, { path: "/api/v1/ggsipu" });
+        clearSessionCookie(res);
         const rawHtml = typeof loginRes.data === "string" ? loginRes.data : "";
         throw new ApiError(401, extractErrorFromHtml(rawHtml));
     }
@@ -176,7 +179,7 @@ const loginAndFetchRecord = async (req, res, { enrollment, password, captcha }) 
         }
         throw new ApiError(502, "GGSIPU portal is unreachable while fetching your academic record.");
     } finally {
-        res.clearCookie(SESSION_COOKIE, { path: "/api/v1/ggsipu" });
+        clearSessionCookie(res);
     }
 
     const raw = typeof resultRes.data === "string" ? resultRes.data : JSON.stringify(resultRes.data);
@@ -195,86 +198,49 @@ const loginAndFetchRecord = async (req, res, { enrollment, password, captcha }) 
     return parsed;
 };
 
-// Public: primary student login — authenticates against GGSIPU directly with
-// enrollment number + portal password + captcha, then finds-or-creates the
-// matching platform account and issues a normal platform session (JWT).
-const studentLogin = asynchandler(async (req, res) => {
-    const { enrollment, password, captcha } = req.body;
-    const { stprofile, stresult, header } = await loginAndFetchRecord(req, res, { enrollment, password, captcha });
-    const cgpa = extractCgpa(stprofile, stresult);
-
-    let user = await User.findOne({ ggsipuEnrollment: stprofile.nrollno });
-    const isNewUser = !user;
-
-    const firstName = stprofile.stname.trim().split(/\s+/)[0].toLowerCase();
-    const ggsipuFields = {
-        name: stprofile.stname,
-        email: `${firstName}.${stprofile.nrollno}@ipu.ac.in`,
-        branch: stprofile.prgname,
-        ggsipuLinked: true,
-        ggsipuEnrollment: stprofile.nrollno,
-        ggsipuProfile: stprofile,
-        ggsipuAcademicRecord: { header: header || null, subjects: stresult },
-        ggsipuLastSyncedAt: new Date(),
-    };
-    if (cgpa !== null) ggsipuFields.cgpa = cgpa;
-
-    const college = await findCollegeForEmail(ggsipuFields.email);
-    if (!college) {
-        throw new ApiError(400, "INVALID DOMAIN: No college is registered for ipu.ac.in");
-    }
-
-    if (!user) {
-        user = await User.create({ ...ggsipuFields, authProvider: "local" });
-    } else {
-        Object.assign(user, ggsipuFields);
-        await user.save({ validateBeforeSave: false });
-    }
-    await linkStudentToCollege(user, college);
-
-    const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(user._id);
-    const safeUser = await User.findById(user._id).select("-password -refreshToken -passwordResetToken -passwordResetExpiry");
-
-    return res
-        .status(isNewUser ? 201 : 200)
-        .cookie("accessToken", accessToken, cookieOptions)
-        .cookie("refreshToken", refreshToken, cookieOptions)
-        .json(new Apiresponse(
-            isNewUser ? 201 : 200,
-            { user: safeUser, accessToken, refreshToken, isNewUser },
-            isNewUser ? "GGSIPU account verified and platform account created" : "Logged in via GGSIPU"
-        ));
-});
-
-// Authenticated: re-syncs the academic record for an already logged-in platform user
+// Authenticated students only: re-syncs the academic record of the signed-in
+// account. GGSIPU is an optional academic-sync connector, never a login
+// (AUTH-FACULTY §15). Linking sets ggsipuLinked, which locks self-edits of
+// cgpa/branch (§6.2).
 const connectGgsipu = asynchandler(async (req, res) => {
     const { enrollment, password, captcha } = req.body;
     const { stprofile, stresult, header } = await loginAndFetchRecord(req, res, { enrollment, password, captcha });
     const cgpa = extractCgpa(stprofile, stresult);
+    const enrollmentNo = String(stprofile.nrollno ?? "").trim();
+    if (!enrollmentNo) {
+        throw new ApiError(502, "GGSIPU returned an incomplete academic record. Please retry.");
+    }
+
+    const alreadyLinked = await User.exists({ ggsipuEnrollment: enrollmentNo, _id: { $ne: req.user._id } });
+    if (alreadyLinked) {
+        throw new ApiError(409, "This GGSIPU enrollment is already linked to another account", [{ code: "ENROLLMENT_ALREADY_LINKED" }]);
+    }
 
     const academicFields = {
-        branch: stprofile.prgname,
+        branch: canonicalBranch(stprofile.prgname) || undefined,
         ggsipuLinked: true,
-        ggsipuEnrollment: stprofile.nrollno,
+        ggsipuEnrollment: enrollmentNo,
         ggsipuProfile: stprofile,
         ggsipuAcademicRecord: { header: header || null, subjects: stresult },
         ggsipuLastSyncedAt: new Date(),
     };
+    if (!academicFields.branch) delete academicFields.branch;
     if (cgpa !== null) academicFields.cgpa = cgpa;
 
     const updatedUser = await User.findByIdAndUpdate(
         req.user._id,
         { $set: academicFields },
-        { new: true, runValidators: true }
-    ).select("-password -refreshToken -passwordResetToken -passwordResetExpiry");
+        { returnDocument: "after", runValidators: true }
+    ).select(USER_SAFE_PROJECTION);
 
     if (!updatedUser) {
-        throw new ApiError(404, "User not found");
+        throw new ApiError(404, "User not found", [{ code: "NOT_FOUND" }]);
     }
 
-    const college = await findCollegeForEmail(updatedUser.email);
+    const college = (updatedUser.college ? await College.findById(updatedUser.college) : null)
+        || await findCollegeForEmail(updatedUser.email);
     if (!college) {
-        throw new ApiError(400, "INVALID DOMAIN: No college is registered for the user email domain");
+        throw new ApiError(400, "INVALID DOMAIN: No college is registered for the user email domain", [{ code: "INVALID_DOMAIN" }]);
     }
     await linkStudentToCollege(updatedUser, college);
 
@@ -283,4 +249,4 @@ const connectGgsipu = asynchandler(async (req, res) => {
         .json(new Apiresponse(200, { user: updatedUser }, "GGSIPU account connected and academic record synced"));
 });
 
-export { getCaptcha, studentLogin, connectGgsipu };
+export { getCaptcha, connectGgsipu };
