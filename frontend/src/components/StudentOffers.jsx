@@ -1,241 +1,305 @@
-import { useEffect, useState, useCallback } from "react";
-import { api } from "../lib/api";
+import { useEffect, useState } from "react";
+import { ArrowUpCircle, CheckCircle2, ExternalLink, Gift, ShieldAlert, Undo2, XCircle } from "lucide-react";
+import { invalidateOpportunitySummary } from "../features/opportunities/summary.js";
 import {
-  CheckCircle, XCircle, ArrowUpCircle, Clock, Package, Building,
-  TrendingUp, Lock, AlertTriangle, Star, Zap
-} from "lucide-react";
+  acceptOffer,
+  getOfferPolicy,
+  listMyOffers,
+  rejectOffer,
+  withdrawOfferAcceptance,
+} from "../lib/api/placements.js";
+import { useSocketEvent } from "../lib/realtime.js";
+import {
+  ConfirmDialog,
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  Panel,
+  StatusBadge,
+  toastError,
+  toastInfo,
+  toastSuccess,
+  useAsync,
+  useNow,
+} from "../ui/index.js";
+import { formatDate, formatDateTime, formatLpa, formatRelative } from "../ui/format.js";
+import { usePanel } from "../workspace/index.js";
 
-const STATUS_STYLES = {
-  extended:  { bg: "bg-blue-100",   text: "text-blue-900",  border: "border-blue-900",  label: "PENDING RESPONSE" },
-  accepted:  { bg: "bg-green-200",  text: "text-green-900", border: "border-green-900", label: "ACCEPTED" },
-  rejected:  { bg: "bg-red-100",    text: "text-red-900",   border: "border-red-900",   label: "REJECTED" },
-  withdrawn: { bg: "bg-gray-200",   text: "text-gray-700",  border: "border-gray-500",  label: "WITHDRAWN" },
-  expired:   { bg: "bg-orange-100", text: "text-orange-900",border: "border-orange-900",label: "EXPIRED" },
-  placed:    { bg: "bg-black",      text: "text-white",     border: "border-black",      label: "PLACED ✓" },
+const OFFER_LABELS = {
+  extended: "Pending response",
+  accepted: "Accepted",
+  rejected: "Declined",
+  withdrawn: "Withdrawn",
+  expired: "Expired",
+  placed: "Placed",
+};
+const TYPE_BADGE = {
+  normal: { label: "NORMAL", className: "bg-gray-100" },
+  dream: { label: "DREAM", className: "bg-purple-100" },
+  "super-dream": { label: "SUPER DREAM", className: "bg-yellow-200" },
 };
 
-const OFFER_TYPE_STYLES = {
-  "normal":     { icon: Package,    color: "bg-gray-100",   label: "OFFER" },
-  "dream":      { icon: Star,       color: "bg-yellow-200", label: "DREAM OFFER" },
-  "super-dream":{ icon: Zap,        color: "bg-purple-200", label: "SUPER DREAM" },
+const lpa = (value) => (value === null || value === undefined ? "—" : formatLpa(value));
+
+function History({ entries }) {
+  if (!entries.length) return null;
+  return (
+    <ol className="space-y-1 border-l-2 border-black pl-3">
+      {entries.map((entry, index) => (
+        <li key={`${entry.status}-${entry.changedAt ?? index}`} className="text-[11px]">
+          <span className="font-black uppercase">{OFFER_LABELS[entry.status] ?? entry.status ?? "Update"}</span>
+          <span className="ml-2 font-bold text-gray-500">{formatDateTime(entry.changedAt)}</span>
+          {entry.note && <div className="font-medium text-gray-700">{entry.note}</div>}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function OfferCard({ offer, policy, highlighted, onAction }) {
+  const now = useNow(60000);
+  const [showHistory, setShowHistory] = useState(false);
+  const type = TYPE_BADGE[offer.offerType] ?? TYPE_BADGE.normal;
+  const pending = offer.status === "extended";
+  const holding = offer.currentAcceptedPackage !== null && offer.currentAcceptedPackage !== undefined;
+  const upgrade = pending && holding && offer.isDreamEligible;
+  const enforced = policy?.enforceOneOffer !== false;
+  const blocked = pending && holding && !offer.isDreamEligible && enforced && !offer.tpoOverride;
+  const expiresMs = offer.expiresAt ? new Date(offer.expiresAt).getTime() : null;
+  const expired = pending && expiresMs !== null && expiresMs <= now;
+  const letter = typeof offer.offerLetterUrl === "string" && /^https?:\/\//i.test(offer.offerLetterUrl) ? offer.offerLetterUrl : null;
+
+  return (
+    <article
+      id={`offer-${offer._id}`}
+      className={`card-stark flex min-w-0 flex-col gap-3 bg-white ${highlighted ? "outline outline-4 outline-yellow-300" : ""}`}
+    >
+      <header className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[10px] font-extrabold uppercase text-gray-600">{offer.companyName}</div>
+          <h4 className="break-words text-sm font-black uppercase leading-tight">{offer.roleTitle}</h4>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <span className={`badge-stark text-[10px] ${type.className}`}>{type.label}</span>
+          <StatusBadge kind="offer" status={offer.status}>
+            {(offer.statusLabel || OFFER_LABELS[offer.status] || offer.status).toUpperCase()}
+          </StatusBadge>
+        </div>
+      </header>
+
+      <div className="flex flex-wrap items-end gap-x-6 gap-y-2">
+        <div>
+          <div className="text-[9px] font-extrabold uppercase text-gray-500">Package</div>
+          <div className="text-lg font-black tabular-nums">{lpa(offer.packageLpa)}</div>
+        </div>
+        {holding && pending && (
+          <div className="text-[11px] font-bold text-gray-700">
+            {lpa(offer.packageLpa)} vs current {lpa(offer.currentAcceptedPackage)}
+            {offer.dreamMultiplier ? <span className="text-gray-500"> (upgrade needs ≥ {offer.dreamMultiplier}× current)</span> : null}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] font-bold uppercase text-gray-600">
+        {offer.location && <span>{offer.location}</span>}
+        {offer.joiningDate && <span>Joining {formatDate(offer.joiningDate)}</span>}
+        {offer.academicYear && <span>AY {offer.academicYear}</span>}
+        {pending && offer.expiresAt && (
+          <span className={expired ? "text-red-700" : "text-orange-700"}>
+            {expired ? "Expired" : "Respond by"} {formatDateTime(offer.expiresAt)} ({formatRelative(offer.expiresAt, now)})
+          </span>
+        )}
+      </div>
+
+      {upgrade && (
+        <p className="flex items-start gap-1.5 border-2 border-black bg-purple-100 p-2 text-[11px] font-bold">
+          <ArrowUpCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          This is a dream upgrade: accepting it releases your current offer.
+        </p>
+      )}
+      {blocked && (
+        <p className="flex items-start gap-1.5 border-2 border-black bg-yellow-100 p-2 text-[11px] font-bold">
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          One-offer policy: you already hold an offer and this one is not a dream upgrade, so it cannot be accepted. You can decline it.
+        </p>
+      )}
+
+      {offer.statusHistory.length > 0 && (
+        <div>
+          <button
+            type="button"
+            onClick={() => setShowHistory((value) => !value)}
+            aria-expanded={showHistory}
+            className="text-[10px] font-black uppercase underline underline-offset-2"
+          >
+            {showHistory ? "Hide history" : `Show history (${offer.statusHistory.length})`}
+          </button>
+          {showHistory && (
+            <div className="mt-2">
+              <History entries={offer.statusHistory} />
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="mt-auto flex flex-wrap gap-2 border-t-[1.5px] border-black pt-3">
+        {letter && (
+          <a href={letter} target="_blank" rel="noopener noreferrer" className="btn-secondary min-h-11 px-2.5 py-1.5 text-[11px] sm:min-h-0">
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+            OFFER LETTER
+          </a>
+        )}
+        {pending && !expired && (
+          <>
+            <button
+              type="button"
+              onClick={() => onAction("accept", offer)}
+              disabled={blocked}
+              title={blocked ? "Blocked by the one-offer policy" : undefined}
+              className="btn-primary min-h-11 px-2.5 py-1.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-40 sm:min-h-0"
+            >
+              {upgrade ? <ArrowUpCircle className="h-3.5 w-3.5" aria-hidden="true" /> : <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />}
+              {upgrade ? "UPGRADE & ACCEPT" : "ACCEPT"}
+            </button>
+            <button
+              type="button"
+              onClick={() => onAction("reject", offer)}
+              className="btn-secondary min-h-11 px-2.5 py-1.5 text-[11px] text-red-700 sm:min-h-0"
+            >
+              <XCircle className="h-3.5 w-3.5" aria-hidden="true" />
+              DECLINE
+            </button>
+          </>
+        )}
+        {offer.status === "accepted" && (
+          <button
+            type="button"
+            onClick={() => onAction("withdraw", offer)}
+            className="btn-secondary min-h-11 px-2.5 py-1.5 text-[11px] text-red-700 sm:min-h-0"
+          >
+            <Undo2 className="h-3.5 w-3.5" aria-hidden="true" />
+            WITHDRAW ACCEPTANCE
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+const DIALOGS = {
+  accept: { title: "ACCEPT THIS OFFER?", confirm: "ACCEPT", danger: false, reason: false },
+  reject: { title: "DECLINE THIS OFFER?", confirm: "DECLINE", danger: true, reason: true },
+  withdraw: { title: "WITHDRAW YOUR ACCEPTANCE?", confirm: "WITHDRAW", danger: true, reason: true },
 };
 
+/** StudentOffers — StudentMode `offers` (usePanel("offers") {offerId, status}). */
 export default function StudentOffers() {
-  const [offers, setOffers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState(null);
-  const [error, setError] = useState(null);
+  const { params } = usePanel("offers");
+  const offers = useAsync(() => listMyOffers(), []);
+  const policy = useAsync(() => getOfferPolicy().catch(() => null), []);
+  useSocketEvent("placement:offer", () => offers.reload());
+  const [pendingAction, setPendingAction] = useState(null);
+  const [busy, setBusy] = useState(false);
 
-  const fetchOffers = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const highlightId = params.offerId ?? null;
+  const list = offers.data ?? [];
+  const visible = params.status ? list.filter((offer) => offer.status === params.status || offer._id === highlightId) : list;
+  const hasHighlight = Boolean(highlightId) && list.some((offer) => offer._id === highlightId);
+  useEffect(() => {
+    if (!hasHighlight) return;
+    document.getElementById(`offer-${highlightId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [hasHighlight, highlightId]);
+
+  const run = async (reason) => {
+    if (!pendingAction) return;
+    const { type, offer } = pendingAction;
+    setBusy(true);
     try {
-      const res = await api.getMyOffers();
-      setOffers(res.data || []);
-    } catch (e) {
-      setError("Failed to fetch offers.");
+      if (type === "accept") {
+        const { released } = await acceptOffer(offer._id);
+        toastSuccess(`Offer from ${offer.companyName} accepted`);
+        if (released.length) toastInfo(`Released: ${released.map((entry) => entry.companyName).filter(Boolean).join(", ")}`);
+      } else if (type === "reject") {
+        await rejectOffer(offer._id, reason);
+        toastSuccess("Offer declined");
+      } else {
+        await withdrawOfferAcceptance(offer._id, reason);
+        toastSuccess("Acceptance withdrawn");
+      }
+      invalidateOpportunitySummary();
+      setPendingAction(null);
+      offers.reload();
+    } catch (error) {
+      toastError(error, "Could not update the offer");
     } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { fetchOffers(); }, [fetchOffers]);
-
-  const handleAction = async (action, offerId, extra = {}) => {
-    setActionLoading(offerId + action);
-    try {
-      if (action === "accept")   await api.acceptOffer(offerId);
-      if (action === "reject")   await api.rejectOffer(offerId, extra.reason);
-      if (action === "withdraw") await api.withdrawOffer(offerId, extra.reason);
-      await fetchOffers();
-    } catch (e) {
-      let msg = "Action failed.";
-      try {
-        const parsed = JSON.parse(e.response?.data?.message || e.message);
-        msg = parsed.message || msg;
-      } catch { msg = e.response?.data?.message || e.message || msg; }
-      alert(msg);
-    } finally {
-      setActionLoading(null);
+      setBusy(false);
     }
   };
 
-  const acceptedOffer = offers.find(o => o.status === "accepted");
-  const blockedByPolicy = !!acceptedOffer;
-
-  if (loading) return (
-    <div className="card-stark p-10 text-center">
-      <div className="text-xs font-black uppercase animate-pulse">Loading your offers...</div>
-    </div>
-  );
+  const activePolicy = policy.data;
+  const dialog = pendingAction ? DIALOGS[pendingAction.type] : null;
+  const pendingCount = list.filter((offer) => offer.status === "extended").length;
 
   return (
-    <div className="card-stark space-y-4 bg-white">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b-2 border-black pb-3 gap-3">
-        <div className="flex items-center gap-2">
-          <Package className="w-5 h-5" />
-          <h3 className="font-black text-sm uppercase">MY PLACEMENT OFFERS</h3>
-        </div>
-        <div className="flex gap-2 flex-wrap">
-          <span className="badge-stark bg-gray-100 text-xs">{offers.length} TOTAL</span>
-          {acceptedOffer && (
-            <span className="badge-stark bg-green-200 text-[10px]">
-              <CheckCircle className="w-3 h-3" /> ACTIVE: {acceptedOffer.companyName} — {acceptedOffer.packageLpa} LPA
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* Policy Block Banner */}
-      {blockedByPolicy && (
-        <div className="flex items-start gap-3 border-2 border-black bg-yellow-50 p-3">
-          <Lock className="w-5 h-5 mt-0.5 shrink-0" />
-          <div>
-            <div className="text-xs font-black uppercase">ONE-OFFER POLICY ACTIVE</div>
-            <p className="text-[11px] font-medium text-gray-700 mt-0.5">
-              You have accepted an offer at <strong>{acceptedOffer.companyName}</strong> ({acceptedOffer.packageLpa} LPA).
-              You are blocked from applying to new drives unless they qualify as a Dream Offer
-              (≥ {((acceptedOffer.currentAcceptedPackage || acceptedOffer.packageLpa) * (acceptedOffer.dreamMultiplier || 1.5)).toFixed(1)} LPA).
-            </p>
+    <Panel title="My offers" icon={Gift} badge={pendingCount ? `${pendingCount} PENDING` : undefined}>
+      {activePolicy && activePolicy.enforceOneOffer !== false && (
+        <div className="mb-4 border-2 border-black bg-blue-100 p-3 text-[11px] font-semibold leading-relaxed">
+          <div className="mb-1 flex items-center gap-1.5 text-xs font-black uppercase">
+            <ShieldAlert className="h-4 w-4" aria-hidden="true" />
+            One-offer policy {activePolicy.academicYear ? `· ${activePolicy.academicYear}` : ""}
           </div>
+          You can hold one accepted offer.
+          {activePolicy.allowDreamUpgrade
+            ? ` A new offer of at least ${activePolicy.dreamMultiplier ?? 1.5}× your current package counts as a dream upgrade and replaces it.`
+            : " Upgrades to a higher offer are not allowed this year."}
+          {Number.isFinite(Number(activePolicy.offerExpiryDays)) && ` Offers expire ${activePolicy.offerExpiryDays} days after they are extended.`}
         </div>
       )}
 
-      {error && (
-        <div className="border-2 border-red-900 bg-red-50 p-3 text-xs font-bold text-red-900">
-          <AlertTriangle className="w-4 h-4 inline mr-1" />{error}
-        </div>
-      )}
-
-      {/* Offers List */}
-      {offers.length === 0 ? (
-        <div className="border-2 border-dashed border-gray-400 p-10 text-center">
-          <Package className="w-8 h-8 mx-auto mb-2 text-gray-400" />
-          <div className="text-xs font-black uppercase">No offers yet</div>
-          <p className="text-[11px] text-gray-500 mt-1">When a company extends you an offer, it will appear here.</p>
-        </div>
+      {offers.error && !offers.data ? (
+        <ErrorState error={offers.error} title="COULD NOT LOAD YOUR OFFERS" onRetry={offers.reload} />
+      ) : !offers.data ? (
+        <LoadingState label="LOADING OFFERS…" />
+      ) : visible.length === 0 ? (
+        <EmptyState icon={Gift} title="No offers yet" text="Offers from campus drives appear here. You will get a notification when one arrives." />
       ) : (
-        <div className="space-y-4">
-          {offers.map((offer) => {
-            const statusStyle = STATUS_STYLES[offer.status] || STATUS_STYLES.extended;
-            const typeStyle = OFFER_TYPE_STYLES[offer.offerType] || OFFER_TYPE_STYLES.normal;
-            const TypeIcon = typeStyle.icon;
-            const isLoading = (key) => actionLoading === offer._id + key;
-
-            return (
-              <div key={offer._id} className={`border-2 border-black p-4 space-y-3 ${offer.tpoOverride ? "border-purple-600" : ""}`}>
-                {/* Card Header */}
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className={`badge-stark ${typeStyle.color} text-[10px] font-black`}>
-                        <TypeIcon className="w-3 h-3" /> {typeStyle.label}
-                      </span>
-                      {offer.tpoOverride && (
-                        <span className="badge-stark bg-purple-200 text-[9px]">TPO OVERRIDE</span>
-                      )}
-                      {offer.isDreamEligible && offer.status === "extended" && (
-                        <span className="badge-stark bg-yellow-300 text-[9px] animate-pulse">UPGRADE ELIGIBLE</span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1.5 mt-1">
-                      <Building className="w-4 h-4" />
-                      <h4 className="font-black text-sm uppercase">{offer.companyName}</h4>
-                    </div>
-                    <div className="text-xs font-bold text-gray-600 mt-0.5">{offer.roleTitle}</div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-2xl font-black">{offer.packageLpa} LPA</div>
-                    <span className={`badge-stark ${statusStyle.bg} ${statusStyle.text} ${statusStyle.border} text-[10px]`}>
-                      {statusStyle.label}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Meta row */}
-                <div className="flex flex-wrap gap-4 text-[11px] font-bold text-gray-500 border-t border-gray-200 pt-2">
-                  {offer.expiresAt && offer.status === "extended" && (
-                    <span className="flex items-center gap-1">
-                      <Clock className="w-3 h-3" />
-                      Expires: {new Date(offer.expiresAt).toLocaleDateString()}
-                    </span>
-                  )}
-                  {offer.academicYear && (
-                    <span>Year: {offer.academicYear}</span>
-                  )}
-                  {offer.isDreamEligible && offer.status === "extended" && (
-                    <span className="flex items-center gap-1 text-yellow-700">
-                      <TrendingUp className="w-3 h-3" />
-                      {offer.packageLpa}x vs current {offer.currentAcceptedPackage} LPA
-                    </span>
-                  )}
-                </div>
-
-                {/* Status History */}
-                {offer.statusHistory?.length > 1 && (
-                  <div className="space-y-1 border-t border-gray-200 pt-2">
-                    <div className="text-[10px] font-extrabold uppercase text-gray-400">Timeline</div>
-                    <div className="flex gap-2 flex-wrap">
-                      {offer.statusHistory.map((h, i) => (
-                        <span key={i} className="badge-stark bg-gray-100 text-[9px]">
-                          {h.status.toUpperCase()} · {new Date(h.changedAt).toLocaleDateString()}
-                          {h.note ? ` — ${h.note}` : ""}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Action Buttons */}
-                {offer.status === "extended" && (
-                  <div className="flex flex-wrap gap-2 border-t-2 border-black pt-3">
-                    <button
-                      onClick={() => handleAction("accept", offer._id)}
-                      disabled={isLoading("accept")}
-                      className="btn-primary flex items-center gap-1.5 px-4 py-2 text-xs"
-                    >
-                      <CheckCircle className="w-4 h-4" />
-                      {isLoading("accept") ? "ACCEPTING..." : offer.isDreamEligible ? "UPGRADE & ACCEPT" : "ACCEPT OFFER"}
-                    </button>
-                    <button
-                      onClick={() => {
-                        const reason = prompt("Reason for rejection (optional):");
-                        handleAction("reject", offer._id, { reason });
-                      }}
-                      disabled={isLoading("reject")}
-                      className="btn-secondary flex items-center gap-1.5 px-4 py-2 text-xs"
-                    >
-                      <XCircle className="w-4 h-4" />
-                      {isLoading("reject") ? "REJECTING..." : "REJECT"}
-                    </button>
-                  </div>
-                )}
-
-                {offer.status === "accepted" && (
-                  <div className="flex flex-wrap gap-2 border-t-2 border-black pt-3">
-                    <div className="badge-stark bg-green-200 text-xs font-black">
-                      <CheckCircle className="w-4 h-4" /> Offer Accepted — Awaiting placement confirmation
-                    </div>
-                    <button
-                      onClick={() => {
-                        if (!confirm("Are you sure you want to withdraw this offer?")) return;
-                        const reason = prompt("Reason for withdrawal:");
-                        handleAction("withdraw", offer._id, { reason });
-                      }}
-                      disabled={isLoading("withdraw")}
-                      className="btn-secondary flex items-center gap-1 px-3 py-1.5 text-xs text-red-700 border-red-700"
-                    >
-                      <ArrowUpCircle className="w-3.5 h-3.5" />
-                      {isLoading("withdraw") ? "WITHDRAWING..." : "WITHDRAW ACCEPTANCE"}
-                    </button>
-                  </div>
-                )}
-              </div>
-            );
-          })}
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          {visible.map((offer) => (
+            <OfferCard
+              key={offer._id}
+              offer={offer}
+              policy={activePolicy}
+              highlighted={offer._id === highlightId}
+              onAction={(type, target) => setPendingAction({ type, offer: target })}
+            />
+          ))}
         </div>
       )}
-    </div>
+
+      {dialog && (
+        <ConfirmDialog
+          open
+          title={dialog.title}
+          body={
+            pendingAction.type === "accept"
+              ? `${pendingAction.offer.roleTitle} at ${pendingAction.offer.companyName} · ${lpa(pendingAction.offer.packageLpa)}.${
+                  pendingAction.offer.currentAcceptedPackage !== null && pendingAction.offer.isDreamEligible
+                    ? " Your current accepted offer will be released."
+                    : ""
+                } Accepting may block other applications under the placement policy.`
+              : pendingAction.type === "reject"
+                ? `Decline the offer from ${pendingAction.offer.companyName}? This cannot be undone.`
+                : `Withdraw your acceptance of ${pendingAction.offer.companyName}? The placement office is notified.`
+          }
+          confirmLabel={dialog.confirm}
+          danger={dialog.danger}
+          busy={busy}
+          requireReason={dialog.reason}
+          reasonLabel="Reason (shared with the placement office)"
+          onConfirm={run}
+          onCancel={() => (busy ? null : setPendingAction(null))}
+        />
+      )}
+    </Panel>
   );
 }

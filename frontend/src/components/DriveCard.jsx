@@ -1,133 +1,139 @@
 import { useState } from "react";
-import { Building, MapPin, DollarSign, CheckCircle, Lock, ArrowUpRight } from "lucide-react";
-import { api } from "../lib/api";
+import { Briefcase, CalendarClock, IndianRupee, MapPin, TriangleAlert } from "lucide-react";
+import { eligibilityBadge, typeLabel } from "../features/opportunities/labels.js";
+import { formatDate, formatLpa, formatRelative } from "../ui/format.js";
+import { useNow } from "../ui/useNow.js";
 
-export default function DriveCard({ drive, onApplicationSubmitted }) {
-  const [applying, setApplying] = useState(false);
-  const [appStatus, setAppStatus] = useState(drive.applicationStatus || null);
+function CompanyLogo({ name, src }) {
+  const [failed, setFailed] = useState(false);
+  if (src && !failed) {
+    return (
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        onError={() => setFailed(true)}
+        className="h-10 w-10 shrink-0 border-[1.5px] border-black bg-white object-contain"
+      />
+    );
+  }
+  return (
+    <span aria-hidden="true" className="flex h-10 w-10 shrink-0 items-center justify-center border-[1.5px] border-black bg-black text-sm font-black uppercase text-white">
+      {String(name || "?").trim().charAt(0) || "?"}
+    </span>
+  );
+}
 
-  const hasExternalApplicationUrl = (() => {
-    try {
-      const url = new URL(drive.applicationUrl);
-      return url.protocol === "http:" || url.protocol === "https:";
-    } catch {
-      return false;
-    }
-  })();
+function Fact({ icon: Icon, children }) {
+  if (!children) return null;
+  return (
+    <span className="inline-flex min-w-0 max-w-full items-center gap-1 text-[11px] font-bold text-gray-700">
+      <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span className="truncate">{children}</span>
+    </span>
+  );
+}
 
-  const handleApply = async () => {
-    setApplying(true);
-    try {
-      await api.applyToDrive(drive._id);
-      setAppStatus("applied");
-      if (onApplicationSubmitted) onApplicationSubmitted(drive._id);
-    } catch {
-      alert("Failed to apply or already applied.");
-    } finally {
-      setApplying(false);
-    }
-  };
+/**
+ * One job (JobVM, features/opportunities/jobVM.js) as a stark card.
+ * Props: { job, highlighted?, actions?, onOpen?, showReasons = true }
+ * No FIT badge when matchScore is null; "Not disclosed" for a missing package;
+ * no invented location; MIN CGPA only when set; no API calls in here.
+ */
+export default function DriveCard({ job, highlighted = false, actions = null, onOpen, showReasons = true }) {
+  const now = useNow(60000);
+  if (!job) return null;
+  const eligibility = eligibilityBadge(job);
+  const deadlineMs = job.deadline ? new Date(job.deadline).getTime() : null;
+  const deadlinePassed = deadlineMs !== null && deadlineMs <= now;
+  const typeText = [typeLabel(job.jobType), typeLabel(job.workType)].filter(Boolean).join(" · ");
+  const matched = new Set(job.matchedSkills.map((skill) => skill.toLowerCase()));
+  const skills = job.skillsRequired.slice(0, 8);
+  const pay = job.kind === "campus" ? formatLpa(job.packageLpa ?? job.salaryText) : job.salaryText || "Not disclosed";
 
   return (
-    <div className={`card-stark flex flex-col justify-between h-full bg-white ${
-      !drive.isEligible ? "opacity-80 bg-gray-50 border-gray-400" : ""
-    }`}>
-      <div>
-        {/* Card Header: Company & Match Badge */}
-        <div className="flex items-start justify-between gap-2 border-b-2 border-black pb-2.5 mb-3">
-          <div>
-            <div className="flex items-center gap-1.5">
-              <Building className="w-4 h-4 text-black" />
-              <h3 className="font-black text-sm uppercase tracking-tight">{drive.companyName}</h3>
-            </div>
-            <p className="font-extrabold text-base text-black mt-0.5">{drive.roleTitle}</p>
-          </div>
-
-          <div className="text-right">
-            <span className={`badge-stark text-xs font-black ${
-              drive.matchPercentage >= 80 ? "bg-green-200" : drive.matchPercentage >= 60 ? "bg-yellow-200" : "bg-gray-200"
-            }`}>
-              {drive.matchPercentage}% FIT
-            </span>
-          </div>
-        </div>
-
-        {/* Eligibility & Compensation Meta */}
-        <div className="grid grid-cols-2 gap-2 mb-3 text-xs">
-          <div className="flex items-center gap-1 font-bold">
-            <DollarSign className="w-3.5 h-3.5" />
-            <span>{drive.packageLpa || "12 LPA"}</span>
-          </div>
-          <div className="flex items-center gap-1 font-semibold text-gray-700">
-            <MapPin className="w-3.5 h-3.5" />
-            <span className="truncate">{drive.location || "Remote"}</span>
-          </div>
-        </div>
-
-        {/* Eligibility Warning or Badge */}
-        <div className="mb-3">
-          {drive.isEligible ? (
-            <span className="badge-stark bg-black text-white text-[11px]">
-              ✓ ELIGIBLE (MIN CGPA {drive.minCgpa})
-            </span>
+    <article
+      id={`job-${job.id}`}
+      className={`card-stark flex min-w-0 flex-col gap-3 bg-white ${highlighted ? "outline outline-4 outline-yellow-300" : ""}`}
+    >
+      <header className="flex min-w-0 items-start gap-3">
+        <CompanyLogo name={job.companyName} src={job.companyLogo} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[10px] font-extrabold uppercase tracking-wide text-gray-600">{job.companyName}</div>
+          {onOpen ? (
+            <button type="button" onClick={onOpen} className="block max-w-full break-words text-left text-sm font-black uppercase leading-tight tracking-tight hover:underline">
+              {job.roleTitle}
+            </button>
           ) : (
-            <span className="badge-stark bg-red-100 text-red-900 border-red-900 text-[10px]">
-              <Lock className="w-3 h-3" /> {drive.eligibilityReason}
-            </span>
+            <h4 className="break-words text-sm font-black uppercase leading-tight tracking-tight">{job.roleTitle}</h4>
+          )}
+          {job.kind === "external" && job.sourceLabels.length > 0 && (
+            <div className="mt-0.5 truncate text-[10px] font-semibold text-gray-500">via {job.sourceLabels.join(", ")}</div>
           )}
         </div>
+      </header>
 
-        {/* Job Description Brief */}
-        <p className="text-xs font-medium text-gray-700 mb-3 line-clamp-2">
-          {drive.jdText}
-        </p>
-
-        {/* Required Skills Pills */}
-        <div className="mb-4">
-          <div className="text-[10px] font-extrabold uppercase text-gray-600 mb-1.5">REQUIRED SKILLS</div>
-          <div className="flex flex-wrap gap-1">
-            {(drive.skillsRequired || []).map((skill, idx) => (
-              <span key={idx} className="badge-stark text-[10px] py-0.5 px-1.5 bg-gray-100">
-                {skill}
-              </span>
-            ))}
-          </div>
-        </div>
+      <div className="flex flex-wrap gap-1.5">
+        <span className={`badge-stark text-[10px] ${job.kind === "campus" ? "bg-green-100" : "bg-blue-100"}`}>
+          {job.kind === "campus" ? "CAMPUS" : "OPEN MARKET"}
+        </span>
+        {job.isSample && <span className="badge-stark bg-gray-200 text-[10px]">SAMPLE LISTING</span>}
+        {job.isNew && <span className="badge-stark bg-yellow-200 text-[10px]">NEW</span>}
+        {job.matchScore !== null && <span className="badge-stark bg-purple-100 text-[10px] tabular-nums">FIT {job.matchScore}%</span>}
+        {eligibility && <span className={`badge-stark text-[10px] ${eligibility.className}`}>{eligibility.label}</span>}
+        {job.minCgpa !== null && <span className="badge-stark text-[10px] tabular-nums">MIN CGPA {job.minCgpa}</span>}
       </div>
 
-      {/* Action Footer */}
-      <div className="border-t-2 border-black pt-3 flex items-center justify-between mt-auto">
-        <span className="text-[10px] font-bold text-gray-500 uppercase">
-          DEADLINE: {drive.deadline ? new Date(drive.deadline).toLocaleDateString() : "UPCOMING"}
-        </span>
-
-        {appStatus ? (
-          <span className="badge-stark bg-green-200 text-black text-xs font-black uppercase">
-            <CheckCircle className="w-3.5 h-3.5" /> APPLIED
-          </span>
-        ) : hasExternalApplicationUrl && drive.isEligible ? (
-          <a
-            href={drive.applicationUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn-primary text-xs py-1 px-3"
-          >
-            APPLY NOW
-            <ArrowUpRight className="w-3.5 h-3.5" />
-          </a>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        <Fact icon={IndianRupee}>{pay}</Fact>
+        <Fact icon={MapPin}>{job.location}</Fact>
+        <Fact icon={Briefcase}>{typeText}</Fact>
+        {job.deadline ? (
+          <Fact icon={CalendarClock}>
+            <span className={deadlinePassed ? "text-red-700" : ""}>
+              {deadlinePassed ? "Closed " : "Apply by "}
+              {formatDate(job.deadline)} ({formatRelative(job.deadline, now)})
+            </span>
+          </Fact>
         ) : (
-          <button
-            onClick={handleApply}
-            disabled={!drive.isEligible || applying}
-            className={`btn-primary text-xs py-1 px-3 ${
-              !drive.isEligible ? "bg-gray-300 text-gray-600 border-gray-400 cursor-not-allowed shadow-none" : ""
-            }`}
-          >
-            {applying ? "APPLYING..." : "APPLY NOW"}
-            <ArrowUpRight className="w-3.5 h-3.5" />
-          </button>
+          job.postedAt && <Fact icon={CalendarClock}>Posted {formatRelative(job.postedAt, now)}</Fact>
         )}
       </div>
-    </div>
+
+      {showReasons && job.kind === "campus" && job.isEligible === false && job.eligibilityReasons.length > 0 && (
+        <p className="flex items-start gap-1.5 border-l-4 border-red-400 bg-red-50 px-2 py-1.5 text-[11px] font-semibold text-red-900">
+          <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {job.eligibilityReasons[0]}
+        </p>
+      )}
+
+      {skills.length > 0 && (
+        <ul className="flex flex-wrap gap-1" aria-label="Skills">
+          {skills.map((skill) => (
+            <li
+              key={skill}
+              className={`border border-black px-1.5 py-0.5 text-[10px] font-bold ${matched.has(skill.toLowerCase()) ? "bg-green-100" : "bg-gray-50"}`}
+            >
+              {skill}
+            </li>
+          ))}
+          {job.skillsRequired.length > skills.length && (
+            <li className="px-1 py-0.5 text-[10px] font-bold text-gray-500">+{job.skillsRequired.length - skills.length}</li>
+          )}
+        </ul>
+      )}
+
+      {job.categories.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {job.categories.slice(0, 4).map((category) => (
+            <span key={category} className="bg-gray-100 px-1.5 py-0.5 text-[10px] font-bold uppercase text-gray-700">
+              #{category}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {actions && <div className="mt-auto border-t-[1.5px] border-black pt-3">{actions}</div>}
+    </article>
   );
 }
