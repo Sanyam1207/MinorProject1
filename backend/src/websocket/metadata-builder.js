@@ -1,5 +1,5 @@
 import { buildProfile, getInstitutionContext } from "./auth-context.js";
-import { getEligibilityJobs } from "./job-service.js";
+import { getEligibilityJobsWithTotal } from "./job-service.js";
 import { buildUserContextMetadata } from "../utils/user-context-metadata.js";
 import { getAvailableAlumniForStudent } from "../services/alumni.service.js";
 import { getLatestResumeForAnalysis, listResumeMetadata } from "../services/resume-bank.service.js";
@@ -17,6 +17,7 @@ const ELIGIBILITY_CONTRACT = {
         "CGPA must be a number between 0 and 10.",
         "Keep the selected job and collected profile values for the current session.",
         "Never invent a missing eligibility value.",
+        "When a job has server_eligibility, report that verdict and its reasons; never re-evaluate it.",
     ],
 };
 
@@ -111,8 +112,9 @@ export const buildRequestMetadata = async ({ modeName, user, effectiveRole, deta
 
     if (normalizedMode === "ai-interviewer") {
         let jobs = [];
+        let jobsTotal = 0;
         try {
-            jobs = await getEligibilityJobs();
+            ({ jobs, total: jobsTotal } = await getEligibilityJobsWithTotal(user));
         } catch (error) {
             console.error("Unable to load jobs for interviewer metadata:", error);
         }
@@ -120,6 +122,7 @@ export const buildRequestMetadata = async ({ modeName, user, effectiveRole, deta
             profile,
             ...institution,
             jobs,
+            jobs_total: jobsTotal,
             selected_job: details.selected_job || null,
             interview_input: {
                 type: details.input_type === "voice" ? "voice" : "text",
@@ -179,8 +182,9 @@ export const buildRequestMetadata = async ({ modeName, user, effectiveRole, deta
     }
 
     let jobs = [];
+    let jobsTotal = 0;
     try {
-        jobs = await getEligibilityJobs();
+        ({ jobs, total: jobsTotal } = await getEligibilityJobsWithTotal(user));
     } catch (error) {
         console.error("Unable to load jobs for eligibility metadata:", error);
     }
@@ -189,6 +193,8 @@ export const buildRequestMetadata = async ({ modeName, user, effectiveRole, deta
         ...ELIGIBILITY_CONTRACT,
         profile,
         jobs,
+        // `jobs` holds at most the 60 most recent active drives; this is how many exist in scope.
+        jobs_total: jobsTotal,
         ...institution,
         ...(await buildAlumniJourneyContext()),
     };

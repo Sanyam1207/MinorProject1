@@ -138,11 +138,17 @@ export const saveInterviewRecommendations = async ({ payload, user }) => {
     );
 };
 
-export const listStudentInterviews = async (ownerId, limit = 20) => {
+const INTERVIEW_LIST_FIELDS = "source role candidateName durationMinutes questionsAsked endedReason generatedAt inputType targetJob overallScore scores topics positives negatives skillGaps summary recommendationPlan recommendationsGeneratedAt createdAt";
+
+/**
+ * The student's interviews, newest first (each with `interviewId`).
+ * @param {{includeRaw?: boolean}} [options] includeRaw adds `rawReport` (the UI prefers it for selected_interview)
+ */
+export const listStudentInterviews = async (ownerId, limit = 20, { includeRaw = false } = {}) => {
     const interviews = await Interview.find({ owner: ownerId })
         .sort({ generatedAt: -1, createdAt: -1 })
         .limit(Math.max(1, Math.min(50, Number(limit) || 20)))
-        .select("source role durationMinutes questionsAsked endedReason generatedAt inputType targetJob overallScore scores topics positives negatives skillGaps summary recommendationPlan recommendationsGeneratedAt createdAt")
+        .select(includeRaw ? `${INTERVIEW_LIST_FIELDS} rawReport` : INTERVIEW_LIST_FIELDS)
         .lean();
     return interviews.map((interview) => ({
         ...interview,
