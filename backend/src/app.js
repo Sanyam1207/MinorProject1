@@ -30,7 +30,6 @@ import auth_router from "./routes/auth.routes.js";
 import ggsipu_router from "./routes/ggsipu.routes.js";
 import pr_outreach_router from "./routes/pr-outreach.routes.js";
 import alumni_router from "./routes/alumni.routes.js";
-import resume_bank_router from "./routes/resume-bank.routes.js";
 import interview_router from "./routes/interview.routes.js";
 import { mountModuleRouters } from "./modules/index.js";
 
@@ -39,7 +38,6 @@ app.use("/api/v1/auth", auth_router);
 app.use("/api/v1/ggsipu", ggsipu_router);
 app.use("/api/v1/pr-outreach", pr_outreach_router);
 app.use("/api/v1/alumni", alumni_router);
-app.use("/api/v1/resume-bank", resume_bank_router);
 app.use("/api/v1/interviews", interview_router);
 
 // Feature modules (attendance, notifications, placements, job feed, resume lab,

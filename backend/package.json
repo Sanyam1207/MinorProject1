@@ -25,7 +25,9 @@
     "setup:interview-speech": "node scripts/setup-interview-speech.mjs",
     "test:watch": "NODE_ENV=test node --test --watch test/",
     "seed:demo": "node scripts/seed-demo.js",
-    "whatsapp": "node scripts/job-feed-whatsapp.js"
+    "whatsapp": "node scripts/job-feed-whatsapp.js",
+    "postinstall": "node scripts/install-tectonic.js",
+    "migrate:resumes": "node scripts/migrate-resumes.js"
   },
   "dependencies": {
     "axios": "^1.19.0",

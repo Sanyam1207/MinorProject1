@@ -14,6 +14,7 @@ import {
 } from "../models/alumni.models.js";
 import { getAvailableAlumniForStudent, getStudentCollegeId } from "../services/alumni.service.js";
 import { Resume } from "../models/resume.models.js";
+import { lockResume, resumeSnapshot } from "../modules/resume-lab/services/resume.service.js";
 import {
     claimAlumniRequestReview,
     completeAlumniRequestReview,
@@ -207,7 +208,7 @@ router.get("/connections/:id/messages", asynchandler(async (req, res) => {
         .sort({ createdAt: -1 })
         .limit(200)
         .populate("sender", "name")
-        .populate("resumeVersion", "title version targetJob status")
+        .populate("resumeVersion", "title version targetJob status kind")
         .lean();
     return res.json(new Apiresponse(200, messages.reverse(), "Messages loaded"));
 }));
@@ -246,8 +247,15 @@ router.post("/connections/:id/share-resume", asynchandler(async (req, res) => {
             text: messageText || "Here is the resume you requested.",
             type: "resume-share",
             resumeVersion: resume._id,
-            resumeSnapshot: { title: resume.title, version: resume.version, targetJob: resume.targetJob },
+            resumeSnapshot: resumeSnapshot(resume),
         });
+        // The shared version must never change afterwards (RESUME-BYOK §13);
+        // edits go through "duplicate". A lock failure never fails the share.
+        try {
+            await lockResume(resume._id, "alumni-share");
+        } catch (lockError) {
+            console.error(`[alumni] could not lock shared resume ${resume._id}:`, lockError);
+        }
         completeResumeShareReview(sessionId);
         return res.status(201).json(new Apiresponse(201, message, "Resume shared with alumnus"));
     } catch (error) {

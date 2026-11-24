@@ -55,6 +55,7 @@ const mentorshipMessageSchema = new Schema({
     type: { type: String, enum: ["text", "resume-share"], default: "text" },
     resumeVersion: { type: Schema.Types.ObjectId, ref: "Resume", default: null },
     resumeSnapshot: {
+        kind: String,
         title: String,
         version: Number,
         targetJob: Schema.Types.Mixed,
