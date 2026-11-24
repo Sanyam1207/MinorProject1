@@ -126,7 +126,7 @@ Sessions
 - `POST /sessions/:id/cancel` (owner, `scheduled|live`) `{reason?}` → notifies "Class cancelled".
 - `POST /sessions/:id/start` (owner; allowed from 30 min before `startsAt` until `endsAt`; `scheduled` → `live`) `{geo?: {lat,lng,accuracy}}` → `{session, qr: {token, version, expiresAt, url, rotationSeconds}}`; notifies students "Attendance is open for CS301 — scan the QR in class". Starting an already-live session just returns the current QR.
 - `POST /sessions/:id/end` (owner) → `{session, stats}` (finalise rules above).
-- `GET /sessions/:id/qr` (owner, live) → `{token, version, expiresAt, url, rotationSeconds}`.
+- `GET /sessions/:id/qr` (owner, live) → `{token, version, expiresAt, url, rotationSeconds}`. If the current token has already expired, it is rotated first (atomically, same rules as the ticker) so a presenter never displays a dead code even if the background ticker lags; `attendance:presenter:join` behaves the same way.
 - `POST /sessions/:id/records` (owner) `{studentId, status: present|late|absent|excused, note?}` → upsert `method: "manual"` → `{record, stats}`; emits `attendance:marked`.
 - `GET /sessions/:id/export.csv` (owner/tpo) → `text/csv` (Roll/Enrollment, Name, Email, Status, Method, Marked At (college TZ)).
 
