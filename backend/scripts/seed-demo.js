@@ -53,6 +53,18 @@ import { purgeResumesForUsers } from "../src/modules/resume-lab/services/resume.
 const DOMAIN = "demo.edu";
 const RECRUITER_DOMAIN = "acme-demo.com";
 const DEMO_EMAIL_RE = /@(demo\.edu|acme-demo\.com)$/i;
+// Optional: DEMO_OWNER_EMAIL=you@gmail.com gives the demo TPO your address and the demo teacher
+// (Anita), student (Diya) and recruiter your "+teacher", "+student", "+recruiter" aliases, so
+// you can sign in to every role with your own inbox. They belong to the demo college, so
+// --reset wipes them with the rest of the demo data.
+const OWNER_EMAIL = String(process.env.DEMO_OWNER_EMAIL || "").trim().toLowerCase();
+const ownerAlias = (tag) => {
+    const [local, domain] = OWNER_EMAIL.split("@");
+    return `${local}+${tag}@${domain}`;
+};
+if (OWNER_EMAIL && !/^[^@\s+]+@[^@\s]+\.[^@\s]+$/.test(OWNER_EMAIL)) {
+    throw new Error("DEMO_OWNER_EMAIL must be a plain address like you@gmail.com (no '+').");
+}
 const COLLEGE_NAME = "Demo Institute of Technology";
 const BRANCHES = ["CSE", "IT", "ECE"];
 const DEPARTMENTS = ["CSE", "IT", "ECE", "Training & Placement"];
@@ -76,7 +88,7 @@ const TPO_FIXTURE = {
 };
 
 const TEACHERS = [
-    { key: "anita", email: "anita.sharma@demo.edu", name: "Dr. Anita Sharma", department: "CSE", designation: "Associate Professor", employeeId: "DIT-F-104" },
+    { key: "anita", email: OWNER_EMAIL ? ownerAlias("teacher") : "anita.sharma@demo.edu", name: "Dr. Anita Sharma", department: "CSE", designation: "Associate Professor", employeeId: "DIT-F-104" },
     { key: "rahul", email: "rahul.verma@demo.edu", name: "Prof. Rahul Verma", department: "IT", designation: "Assistant Professor", employeeId: "DIT-F-117" },
 ];
 
@@ -95,7 +107,7 @@ const ALUMNI = [
     },
 ];
 
-const RECRUITER = { email: "hr@acme-demo.com", name: "Sameer Khanna", designation: "Campus Hiring Manager", companyName: "Acme Technologies" };
+const RECRUITER = { email: OWNER_EMAIL ? ownerAlias("recruiter") : "hr@acme-demo.com", name: "Sameer Khanna", designation: "Campus Hiring Manager", companyName: "Acme Technologies" };
 
 const PERSONAS = {
     W: { skills: ["JavaScript", "React", "Node.js", "MongoDB", "REST APIs"], project: "Event booking web app",
@@ -412,7 +424,7 @@ const buildStudentFixtures = () => {
                 first,
                 last,
                 name: `${first} ${last}`,
-                email: emailOf(first, last),
+                email: OWNER_EMAIL && key === "diya" ? ownerAlias("student") : emailOf(first, last),
                 branch: canonicalBranch(group.branch),
                 section: group.section,
                 rollNumber: `DIT27${group.branch}${group.section}${String(index + 1).padStart(2, "0")}`,
@@ -428,9 +440,9 @@ const buildStudentFixtures = () => {
 };
 
 const seedIdentity = async ({ passwordHash, log, warnings }) => {
-    const tpoEmail = TPO_EMAIL && TPO_EMAIL.endsWith(`@${DOMAIN}`) ? TPO_EMAIL : `tpo@${DOMAIN}`;
+    const tpoEmail = OWNER_EMAIL || (TPO_EMAIL && TPO_EMAIL.endsWith(`@${DOMAIN}`) ? TPO_EMAIL : `tpo@${DOMAIN}`);
     const notes = [];
-    if (tpoEmail !== TPO_EMAIL) notes.push(`TPO_EMAIL is not a @${DOMAIN} address; the demo TPO is ${tpoEmail}.`);
+    if (!OWNER_EMAIL && tpoEmail !== TPO_EMAIL) notes.push(`TPO_EMAIL is not a @${DOMAIN} address; the demo TPO is ${tpoEmail}.`);
 
     const college = await College.findOneAndUpdate(
         { domain: DOMAIN },
@@ -1300,7 +1312,7 @@ const seedNotifications = async (ctx, attendance, placements, { log }) => {
 // ── Summary data ────────────────────────────────────────────────────────────
 
 const countAll = async (ctx, attendance) => {
-    const userIds = (await User.find({ email: DEMO_EMAIL_RE }).distinct("_id"));
+    const userIds = (await User.find({ $or: [{ email: DEMO_EMAIL_RE }, { college: ctx.college._id }] }).distinct("_id"));
     const courseIds = attendance.courses.map(({ course }) => course._id);
     const count = async (name, filter) => (M(name) ? M(name).countDocuments(filter) : 0);
     const jobIds = M("Job") ? await M("Job").find({ college: ctx.college._id }).distinct("_id") : [];
